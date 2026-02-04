@@ -881,22 +881,75 @@ function Test-EventLogs {
         }
     )
 
+    # Patterns to exclude (self-references from this scanner)
+    $excludePatterns = @(
+        "Detect-Chrysalis",
+        "ChrysalisScan",
+        "Chrysalis/Lotus Blossom.*IoC Scanner",
+        "Write-Finding.*-Severity",
+        "Test-EventLogs",
+        "\$logQueries\s*=",
+        "function\s+Test-"
+    )
+
     foreach ($q in $logQueries) {
         try {
             $events = Get-WinEvent -LogName $q.LogName -MaxEvents 1000 -ErrorAction SilentlyContinue |
             Where-Object { $_.Message -match $q.Pattern } |
-            Select-Object -First 10
+            Select-Object -First 20
 
             foreach ($e in $events) {
-                # Store full message for JSON output, truncated preview for console
-                $fullMsg = $e.Message
-                $displayMsg = $fullMsg
-                if ($displayMsg.Length -gt 180) { $displayMsg = $displayMsg.Substring(0, 180) + "..." }
+                $msg = $e.Message
+
+                # Skip self-references (scanner detecting itself in logs)
+                $isSelfReference = $false
+                foreach ($ex in $excludePatterns) {
+                    if ($msg -match $ex) { $isSelfReference = $true; break }
+                }
+                if ($isSelfReference) { continue }
+
+                # Extract the specific matched pattern with context
+                $matchedPatterns = @()
+                $contextSnippets = @()
+
+                # Find all pattern matches and extract context
+                $patternParts = $q.Pattern -split '\|'
+                foreach ($pat in $patternParts) {
+                    if ($msg -match $pat) {
+                        $matchedPatterns += $pat
+                        # Extract ~50 chars of context around the match
+                        if ($msg -match "(.{0,50}$pat.{0,50})") {
+                            $snippet = $Matches[1] -replace '[\r\n]+', ' '
+                            $snippet = $snippet.Trim()
+                            if ($snippet.Length -gt 120) {
+                                $snippet = $snippet.Substring(0, 120) + "..."
+                            }
+                            if ($snippet -and $snippet -notin $contextSnippets) {
+                                $contextSnippets += $snippet
+                            }
+                        }
+                    }
+                }
+
+                if ($matchedPatterns.Count -eq 0) { continue }
+
+                # Build clean, structured output
+                $matchedStr = ($matchedPatterns | Select-Object -Unique) -join ", "
+                $contextStr = if ($contextSnippets.Count -gt 0) {
+                    ($contextSnippets | Select-Object -First 3) -join " | "
+                }
+                else { "[context extraction failed]" }
+
+                # Structured details for JSON
+                $details = "EventTime: $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | EventId: $($e.Id) | Log: $($q.LogName) | Matched: $matchedStr | Context: $contextStr"
+
+                # Shorter display for console
+                $displayDetails = "Time: $($e.TimeCreated.ToString('HH:mm:ss')) | Matched: $matchedStr | $($contextSnippets | Select-Object -First 1)"
 
                 Write-Finding -Severity "MEDIUM" -Category "Event Log" `
                     -Message "Suspicious pattern match in $($q.LogName) (ID: $($e.Id))" `
-                    -Details "$($e.TimeCreated): $fullMsg" `
-                    -DisplayDetails "$($e.TimeCreated): $displayMsg"
+                    -Details $details `
+                    -DisplayDetails $displayDetails
             }
         }
         catch {
