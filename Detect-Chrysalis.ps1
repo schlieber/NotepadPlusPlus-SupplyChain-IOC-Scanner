@@ -68,7 +68,7 @@
     Run without changing system execution policy.
 
 .NOTES
-    Version    : 4.0.0
+    Version    : 1.0.0.1
     Author     : Simon Schlieber (@schlieber)
     Repository : https://github.com/schlieber/NotepadPlusPlus-SupplyChain-IOC-Scanner
     Date       : February 2026
@@ -241,7 +241,8 @@ function Write-Finding {
         [string]$Severity,
         [string]$Category,
         [string]$Message,
-        [string]$Details = ""
+        [string]$Details = "",
+        [string]$DisplayDetails = ""  # Optional: truncated version for console output
     )
 
     $color = switch ($Severity) {
@@ -252,15 +253,19 @@ function Write-Finding {
         "INFO" { "Gray" }
     }
 
+    # Use DisplayDetails for console if provided, otherwise use Details
+    $consoleDetails = if ($DisplayDetails) { $DisplayDetails } else { $Details }
+
     if (-not $Quiet) {
         Write-Host "  [$Severity] " -ForegroundColor $color -NoNewline
         Write-Host "$Category - " -ForegroundColor White -NoNewline
         Write-Host $Message -ForegroundColor $color
-        if ($Details) {
-            Write-Host "            $Details" -ForegroundColor DarkGray
+        if ($consoleDetails) {
+            Write-Host "            $consoleDetails" -ForegroundColor DarkGray
         }
     }
 
+    # Always store full Details in the findings (for JSON/CSV export)
     [void]$Findings.Add([PSCustomObject]@{
             Timestamp    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             Severity     = $Severity
@@ -883,12 +888,15 @@ function Test-EventLogs {
             Select-Object -First 10
 
             foreach ($e in $events) {
-                $msg = $e.Message
-                if ($msg.Length -gt 180) { $msg = $msg.Substring(0, 180) + "..." }
+                # Store full message for JSON output, truncated preview for console
+                $fullMsg = $e.Message
+                $displayMsg = $fullMsg
+                if ($displayMsg.Length -gt 180) { $displayMsg = $displayMsg.Substring(0, 180) + "..." }
 
                 Write-Finding -Severity "MEDIUM" -Category "Event Log" `
                     -Message "Suspicious pattern match in $($q.LogName) (ID: $($e.Id))" `
-                    -Details "$($e.TimeCreated): $msg"
+                    -Details "$($e.TimeCreated): $fullMsg" `
+                    -DisplayDetails "$($e.TimeCreated): $displayMsg"
             }
         }
         catch {
