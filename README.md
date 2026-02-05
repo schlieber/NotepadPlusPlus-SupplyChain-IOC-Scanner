@@ -1,10 +1,12 @@
-# NotepadPlusPlus-SupplyChain-IOC-Scanner
+# Notepad++ Supply Chain IOC Scanner (Detect CVE-2025-15556 & Chrysalis)
 
 **Notepad++ Supply Chain Attack IoC Scanner | Chrysalis Backdoor Detection | Lotus Blossom APT Malware Scanner | CVE-2025-15556**
 
-[![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1+-blue.svg)](https://docs.microsoft.com/en-us/powershell/)
+[![PowerShell Script to Scan for Notepad++ Malware](https://img.shields.io/badge/PowerShell-5.1+-blue.svg)](https://docs.microsoft.com/en-us/powershell/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![CVE-2025-15556](https://img.shields.io/badge/CVE-2025--15556-red.svg)](https://www.cve.org/CVERecord?id=CVE-2025-15556)
+[![CVE-2025-15556 Vulnerability Check](https://img.shields.io/badge/CVE-2025--15556-red.svg)](https://www.cve.org/CVERecord?id=CVE-2025-15556)
+
+A free, open-source PowerShell tool to detect the Notepad++ supply chain attack (CVE-2025-15556). Scan Windows systems for Chrysalis backdoor and Lotus Blossom APT indicators without installing external software. It checks for compromised file artifacts, suspicious persistence, and known C2 infrastructure.
 
 ---
 
@@ -41,27 +43,29 @@ A **read-only, non-destructive PowerShell scanner** that detects **Indicators of
 | 10 | **Hosts File** | C2 domain entries (blocking-aware detection) |
 | 11 | **Notepad++ Discovery + Signature** | Multi-source install discovery + Notepad++/GUP.exe Authenticode validation + pre-8.8.9 updater-hardening warning |
 | 12 | **Exfil Artifacts** | Recon staging files (1.txt, a.txt, u.bat) |
-| 13 | **Event Log Analysis** | PowerShell & Application log pattern matching |
+| 13 | **Event Log Analysis** | Correlated indicator matching across PowerShell, System, Task Scheduler, Sysmon, and Security logs |
 | 14 | **Entropy Detection** | Packed/obfuscated files (Shannon entropy > 7.2) |
 | 15 | **Content Scanning** | Campaign strings, decryption keys, C2 URLs |
 | 16 | **Windows Services** | Service path analysis for persistence |
 
 ---
 
-## 📥 Quick Start
+## 📥 How to Scan for Notepad++ Malware
 
-```powershell
-# Download and run (no installation required)
-irm https://raw.githubusercontent.com/schlieber/NotepadPlusPlus-SupplyChain-IOC-Scanner/main/Detect-Chrysalis.ps1 | iex
+1. **Open PowerShell**: Run as Administrator for full service and registry visibility.
+2. **Download scanner**:
+   ```powershell
+   irm https://raw.githubusercontent.com/schlieber/NotepadPlusPlus-SupplyChain-IOC-Scanner/main/Detect-Chrysalis.ps1 | iex
+   ```
+3. **Analyze results**: Investigate all `CRITICAL` and `HIGH` findings immediately, then preserve the JSON/CSV report for incident response.
+4. **Optional (run locally from clone)**:
+   ```powershell
+   git clone https://github.com/schlieber/NotepadPlusPlus-SupplyChain-IOC-Scanner.git
+   cd NotepadPlusPlus-SupplyChain-IOC-Scanner
+   .\Detect-Chrysalis.ps1
+   ```
 
-# Or clone and run locally
-git clone https://github.com/schlieber/NotepadPlusPlus-SupplyChain-IOC-Scanner.git
-cd NotepadPlusPlus-SupplyChain-IOC-Scanner
-.\Detect-Chrysalis.ps1
-```
-
-### Bypass Execution Policy (if needed)
-
+If execution policy blocks script launch:
 ```powershell
 powershell -ExecutionPolicy Bypass -File Detect-Chrysalis.ps1
 ```
@@ -74,11 +78,14 @@ powershell -ExecutionPolicy Bypass -File Detect-Chrysalis.ps1
 # Standard scan with colored output
 .\Detect-Chrysalis.ps1
 
-# Deep scan (includes Downloads, Temp, ProgramData)
+# Deep scan (includes additional user/app/package paths + expanded event logs)
 .\Detect-Chrysalis.ps1 -DeepScan
 
-# Export results to JSON and CSV
-.\Detect-Chrysalis.ps1 -ExportCSV -OutputPath "C:\SecurityLogs"
+# Export JSON report
+.\Detect-Chrysalis.ps1 -ExportJSON -OutputPath "C:\SecurityLogs"
+
+# Export JSON + CSV
+.\Detect-Chrysalis.ps1 -ExportJSON -ExportCSV -OutputPath "C:\SecurityLogs"
 
 # Quiet mode (only shows findings, no OK messages)
 .\Detect-Chrysalis.ps1 -Quiet
@@ -88,22 +95,26 @@ powershell -ExecutionPolicy Bypass -File Detect-Chrysalis.ps1
 
 | Parameter | Description |
 |-----------|-------------|
-| `-OutputPath` | Directory for JSON/CSV reports (default: Desktop) |
-| `-ExportCSV` | Export findings to CSV in addition to JSON |
-| `-DeepScan` | Scan additional directories for hash matches |
+| `-OutputPath` | Directory for JSON/CSV reports when export switches are used |
+| `-ExportJSON` | Export full report to JSON |
+| `-ExportCSV` | Export findings to CSV |
+| `-DeepScan` | Scan additional directories for hash matches and expand event log coverage |
 | `-Quiet` | Suppress clean/OK output, only show findings |
 
 ---
 
 ## 📊 Output & Reporting
 
-The scanner automatically generates a **JSON report** for incident response:
+By default, the scanner does **not write anything to disk**.  
+Use `-ExportJSON` and/or `-ExportCSV` to persist results.
+
+JSON export example:
 
 ```
 ChrysalisScan_20260204_143052.json
 ```
 
-With `-ExportCSV`, also generates:
+CSV export example:
 
 ```
 ChrysalisScan_20260204_143052.csv
@@ -218,7 +229,21 @@ This scanner incorporates selected Lotus Blossom-related filename/path patterns 
 - Detects **known IoCs only** — zero-day variants may not be detected
 - Does **not replace** EDR/AV or full forensic investigation
 - Some checks require **elevated privileges** for complete coverage
+- Event log coverage depends on local audit/logging policy and available retention
 - Network detection may miss **cleared DNS caches**
+
+---
+
+## ❓ Frequently Asked Questions (FAQ)
+
+### How do I check if my Notepad++ is infected?
+Run `Detect-Chrysalis.ps1` on the target Windows host and review `CRITICAL`/`HIGH` findings first. Correlate hits across hashes, persistence, process paths, and network indicators before concluding compromise status.
+
+### Is this scanner safe and non-destructive?
+Yes. The script is read-only: it inspects files, registry keys, process/task/service state, and network artifacts without changing host configuration.
+
+### Does this tool fix CVE-2025-15556?
+No. It detects known compromise indicators. If infected, rebuild or reimage affected systems, reinstall Notepad++ from trusted sources, rotate credentials, and complete IR containment/eradication steps.
 
 ---
 

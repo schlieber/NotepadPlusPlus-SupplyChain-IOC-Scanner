@@ -36,10 +36,13 @@
       16. Windows service path analysis
 
 .PARAMETER OutputPath
-    Directory for JSON/CSV report output. Defaults to user's Desktop.
+    Directory for JSON/CSV report output when export switches are used.
 
 .PARAMETER ExportCSV
-    Also export findings to CSV format (in addition to JSON).
+    Export findings to CSV format.
+
+.PARAMETER ExportJSON
+    Export findings/report to JSON format.
 
 .PARAMETER DeepScan
     Extends hash scanning to include Downloads, Temp, and ProgramData directories.
@@ -56,7 +59,11 @@
     Run with extended hash scanning across additional directories.
 
 .EXAMPLE
-    .\Detect-Chrysalis.ps1 -ExportCSV -OutputPath "C:\Logs"
+    .\Detect-Chrysalis.ps1 -ExportJSON -OutputPath "C:\Logs"
+    Run scan and export results to JSON in C:\Logs.
+
+.EXAMPLE
+    .\Detect-Chrysalis.ps1 -ExportJSON -ExportCSV -OutputPath "C:\Logs"
     Run scan and export results to both JSON and CSV in C:\Logs.
 
 .EXAMPLE
@@ -99,6 +106,10 @@
     - Active since at least 2012
     - Targets government, military, and technology sectors
 
+.KEYWORDS
+    Notepad++ hack detection, CVE-2025-15556, Chrysalis backdoor, Lotus Blossom,
+    Billbug, supply chain compromise, IoC scanner, PowerShell DFIR tool
+
 .LINK
     https://www.rapid7.com/blog/post/tr-chrysalis-backdoor-dive-into-lotus-blossoms-toolkit/
 
@@ -121,6 +132,7 @@
 [CmdletBinding()]
 param(
     [string]$OutputPath = "$env:USERPROFILE\Desktop",
+    [switch]$ExportJSON,
     [switch]$ExportCSV,
     [switch]$DeepScan,
     [switch]$Quiet
@@ -519,6 +531,17 @@ function Test-IsAdministrator {
     catch { return $false }
 }
 
+function Get-DefaultOutputPath {
+    $desktopCandidates = @(
+        "$env:USERPROFILE\Desktop",
+        "$env:HOMEDRIVE$env:HOMEPATH\Desktop"
+    ) | Where-Object { $_ -and (Test-Path -Path $_ -PathType Container) } | Select-Object -Unique
+
+    if ($desktopCandidates.Count -gt 0) { return $desktopCandidates[0] }
+    if ($PSScriptRoot -and (Test-Path -Path $PSScriptRoot -PathType Container)) { return $PSScriptRoot }
+    return (Get-Location).Path
+}
+
 function Get-SafeFileHash {
     param([string]$FilePath, [ValidateSet("SHA256", "SHA1")] [string]$Algorithm = "SHA256")
     try {
@@ -806,8 +829,17 @@ function Test-FileHashes {
     if ($DeepScan) {
         $scanRoots += @(
             "$env:USERPROFILE\Downloads",
+            "$env:PUBLIC\Downloads",
+            "$env:USERPROFILE\Desktop",
+            "$env:USERPROFILE\Documents",
             "$env:LOCALAPPDATA\Temp",
-            "C:\ProgramData"
+            "$env:LOCALAPPDATA\Programs\Notepad++",
+            "$env:ProgramFiles\Notepad++",
+            "$env:ProgramFiles(x86)\Notepad++",
+            "$env:USERPROFILE\scoop\apps\notepadplusplus\current",
+            "$env:SCOOP\apps\notepadplusplus\current",
+            "$env:ChocolateyInstall\lib\notepadplusplus",
+            $ProgramDataRoot
         )
     }
 
@@ -1230,19 +1262,151 @@ function Test-ExfilArtifacts {
     }
 }
 
+function Get-EventMessageText {
+    param([object]$EventRecord)
+
+    $msg = $null
+    try { $msg = $EventRecord.FormatDescription() } catch {}
+    if ([string]::IsNullOrWhiteSpace($msg)) {
+        try { $msg = [string]$EventRecord.Message } catch {}
+    }
+    if ([string]::IsNullOrWhiteSpace($msg)) {
+        try { $msg = [string]$EventRecord.ToXml() } catch {}
+    }
+    return $msg
+}
+
+function Get-EventDataMap {
+    param([object]$EventRecord)
+
+    $map = [ordered]@{}
+    try {
+        [xml]$xml = $EventRecord.ToXml()
+        $idx = 0
+
+        foreach ($d in @($xml.Event.EventData.Data)) {
+            if ($null -eq $d) { continue }
+
+            $name = [string]$d.Name
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                $name = "Data$idx"
+                $idx++
+            }
+
+            $val = [string]$d.'#text'
+            if (-not [string]::IsNullOrWhiteSpace($val) -and -not $map.Contains($name)) {
+                $map[$name] = $val.Trim()
+            }
+        }
+
+        if ($xml.Event.UserData) {
+            foreach ($root in @($xml.Event.UserData.ChildNodes)) {
+                foreach ($child in @($root.ChildNodes)) {
+                    if ($null -eq $child) { continue }
+
+                    $name = "UserData.$($child.LocalName)"
+                    $val = [string]$child.InnerText
+                    if (-not [string]::IsNullOrWhiteSpace($val) -and -not $map.Contains($name)) {
+                        $map[$name] = $val.Trim()
+                    }
+                }
+            }
+        }
+    }
+    catch {}
+
+    return $map
+}
+
+function Get-EventIndicatorMatches {
+    param(
+        [string]$Text,
+        [array]$IndicatorRules
+    )
+
+    $matches = New-Object System.Collections.Generic.List[object]
+    foreach ($rule in $IndicatorRules) {
+        if ($Text -match $rule.Regex) {
+            $matches.Add([PSCustomObject]@{
+                    Name   = $rule.Name
+                    Regex  = $rule.Regex
+                    Weight = $rule.Weight
+                })
+        }
+    }
+
+    $strong = @($matches | Where-Object { $_.Weight -ge 80 } | Select-Object -ExpandProperty Name -Unique)
+    $medium = @($matches | Where-Object { $_.Weight -lt 80 } | Select-Object -ExpandProperty Name -Unique)
+    $isMatch = ($strong.Count -ge 1) -or ($medium.Count -ge 2)
+
+    return [PSCustomObject]@{
+        IsMatch = $isMatch
+        Strong  = $strong
+        Medium  = $medium
+        All     = @($matches | Select-Object -Unique Name, Regex, Weight)
+    }
+}
+
 function Test-EventLogs {
     Write-CheckHeader 13 "Event log sweep (MEDIUM signal, not confirmatory)..."
+
+    if (-not (Get-Command -Name Get-WinEvent -ErrorAction SilentlyContinue)) {
+        Write-Finding -Severity "INFO" -Category "Event Log" `
+            -Message "Get-WinEvent is unavailable in this PowerShell session" `
+            -Details "Event log check skipped"
+        return
+    }
+
+    $indicatorRules = @(
+        @{ Name = "Bluetooth AppData execution path"; Weight = 100; Regex = '\\appdata\\roaming\\bluetooth\\(?:bluetoothservice\.exe|log\.dll|bluetoothservice\b)' },
+        @{ Name = "USOShared payload path"; Weight = 100; Regex = '\\programdata\\usoshared\\(?:conf\.c|libtcc\.dll|svchost\.exe)' },
+        @{ Name = "ProShow exploit path"; Weight = 85; Regex = '\\appdata\\roaming\\proshow\\(?:load|proshow\.exe)' },
+        @{ Name = "Adobe Scripts loader path"; Weight = 85; Regex = '\\appdata\\roaming\\adobe\\scripts\\(?:alien\.ini|script\.exe)' },
+        @{ Name = "Chrysalis mutex reference"; Weight = 100; Regex = 'global\\jdhfv_1\.0\.1' },
+        @{ Name = "temp.sh exfil upload"; Weight = 90; Regex = 'temp\.sh/upload|curl\.exe\s+-f\s+\"?file=@' },
+        @{ Name = "Known C2 domain"; Weight = 90; Regex = 'api\.skycloudcenter\.com|api\.wiresguard\.com|cdncheck\.it\.com|safe-dns\.it\.com|self-dns\.it\.com' },
+        @{ Name = "Known update URL pattern"; Weight = 85; Regex = '45\.76\.155\.202/update/(?:update|install|autoupdater)\.exe|45\.32\.144\.255/update/update\.exe|95\.179\.213\.0/update/(?:update|install|autoupdater)\.exe' },
+        @{ Name = "Recon command chain"; Weight = 70; Regex = 'whoami&&tasklist(?:&&systeminfo&&netstat\s+-ano)?' },
+        @{ Name = "Split recon command"; Weight = 70; Regex = 'cmd\s+/c\s+(?:whoami|tasklist|systeminfo|netstat\s+-ano)\s*>>\s*a\.txt' },
+        @{ Name = "Campaign artifact filename"; Weight = 65; Regex = '\b(?:bluetoothservice\.exe|log\.dll|alien\.ini|script\.exe|libtcc\.dll|conf\.c|u\.bat|s047t5g\.exe|consoleapplication2\.exe)\b' }
+    )
 
     $logQueries = @(
         @{
             LogName = "Microsoft-Windows-PowerShell/Operational"
-            Pattern = "whoami|tasklist|systeminfo|netstat|curl.*temp\.sh|BluetoothService|ProShow|alien\.ini|libtcc"
+            EventIds = @(4103, 4104, 4105, 4106)
         },
         @{
-            LogName = "Application"
-            Pattern = "GUP\.exe|NSIS|notepad\+\+|BluetoothService|ConsoleApplication2|AutoUpdater\.exe|install\.exe|update/update\.exe|getDownloadUrl\.php"
+            LogName = "Windows PowerShell"
+            EventIds = @(800)
+        },
+        @{
+            LogName = "System"
+            EventIds = @(7045)
+            Providers = @("Service Control Manager")
         }
     )
+
+    if ($DeepScan) {
+        $logQueries += @(
+            @{
+                LogName = "Microsoft-Windows-TaskScheduler/Operational"
+                EventIds = @(106, 140, 141, 200, 201)
+            },
+            @{
+                LogName = "Microsoft-Windows-Sysmon/Operational"
+                EventIds = @(1, 3, 7, 11, 13, 22)
+            },
+            @{
+                LogName = "Security"
+                EventIds = @(4688)
+            },
+            @{
+                LogName = "Application"
+                EventIds = @(1000, 1001)
+            }
+        )
+    }
 
     # Patterns to exclude (self-references from this scanner)
     $excludePatterns = @(
@@ -1255,69 +1419,134 @@ function Test-EventLogs {
         "function\s+Test-"
     )
 
+    $maxEvents = if ($DeepScan) { 5000 } else { 2000 }
+    $maxFindingsPerLog = if ($DeepScan) { 35 } else { 12 }
+    $lookbackDays = if ($DeepScan) { 730 } else { 365 }
+    $startTime = (Get-Date).AddDays(-$lookbackDays)
+
     foreach ($q in $logQueries) {
+        $logName = [string]$q.LogName
+
         try {
-            $events = Get-WinEvent -LogName $q.LogName -MaxEvents 1000 -ErrorAction SilentlyContinue |
-            Where-Object { $_.Message -match $q.Pattern } |
-            Select-Object -First 20
-
-            foreach ($e in $events) {
-                $msg = $e.Message
-                if ([string]::IsNullOrWhiteSpace($msg)) { continue }
-
-                # Skip self-references (scanner detecting itself in logs)
-                $isSelfReference = $false
-                foreach ($ex in $excludePatterns) {
-                    if ($msg -match $ex) { $isSelfReference = $true; break }
-                }
-                if ($isSelfReference) { continue }
-
-                # Extract the specific matched pattern with context
-                $matchedPatterns = @()
-                $contextSnippets = @()
-
-                # Find all pattern matches and extract context
-                $patternParts = $q.Pattern -split '\|'
-                foreach ($pat in $patternParts) {
-                    if ($msg -match $pat) {
-                        $matchedPatterns += $pat
-                        # Extract ~50 chars of context around the match
-                        if ($msg -match "(.{0,50}$pat.{0,50})") {
-                            $snippet = $Matches[1] -replace '[\r\n]+', ' '
-                            $snippet = $snippet.Trim()
-                            if ($snippet.Length -gt 120) {
-                                $snippet = $snippet.Substring(0, 120) + "..."
-                            }
-                            if ($snippet -and $snippet -notin $contextSnippets) {
-                                $contextSnippets += $snippet
-                            }
-                        }
-                    }
-                }
-
-                if ($matchedPatterns.Count -eq 0) { continue }
-
-                # Build clean, structured output
-                $matchedStr = ($matchedPatterns | Select-Object -Unique) -join ", "
-                $contextStr = if ($contextSnippets.Count -gt 0) {
-                    ($contextSnippets | Select-Object -First 3) -join " | "
-                }
-                else { "[context extraction failed]" }
-
-                # Structured details for JSON
-                $details = "EventTime: $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | EventId: $($e.Id) | Log: $($q.LogName) | Matched: $matchedStr | Context: $contextStr"
-
-                # Shorter display for console
-                $displayDetails = "Time: $($e.TimeCreated.ToString('HH:mm:ss')) | Matched: $matchedStr | $($contextSnippets | Select-Object -First 1)"
-
-                Write-Finding -Severity "MEDIUM" -Category "Event Log" `
-                    -Message "Suspicious pattern match in $($q.LogName) (ID: $($e.Id))" `
-                    -Details $details `
-                    -DisplayDetails $displayDetails
+            $logInfo = Get-WinEvent -ListLog $logName -ErrorAction Stop
+            if (-not $logInfo.IsEnabled) {
+                if (-not $Quiet) { Write-Host "  [INFO] Skipping disabled log: $logName" -ForegroundColor DarkGray }
+                continue
             }
         }
         catch {
-            if (-not $Quiet) { Write-Host "  [INFO] Could not query $($q.LogName)" -ForegroundColor DarkGray }
+            if (-not $Quiet) { Write-Host "  [INFO] Could not access log metadata: $logName | $($_.Exception.Message)" -ForegroundColor DarkGray }
+            continue
+        }
+
+        try {
+            $filter = @{
+                LogName = $logName
+                StartTime = $startTime
+            }
+            if ($q.EventIds) { $filter.Id = $q.EventIds }
+            if ($q.Providers) { $filter.ProviderName = $q.Providers }
+
+            $events = Get-WinEvent -FilterHashtable $filter -MaxEvents $maxEvents -ErrorAction Stop
+        }
+        catch {
+            if (-not $Quiet) { Write-Host "  [INFO] Could not query $logName | $($_.Exception.Message)" -ForegroundColor DarkGray }
+            continue
+        }
+
+        $findingsInLog = 0
+
+        foreach ($e in $events) {
+            if ($findingsInLog -ge $maxFindingsPerLog) { break }
+
+            $msg = $null
+            try { $msg = $e.FormatDescription() } catch {}
+            if ([string]::IsNullOrWhiteSpace($msg)) {
+                try { $msg = $e.Message } catch {}
+            }
+
+            $xml = $null
+            try { $xml = $e.ToXml() } catch {}
+
+            $searchText = @($msg, $xml) -join "`n"
+            if ([string]::IsNullOrWhiteSpace($searchText)) { continue }
+
+            $matchResult = Get-EventIndicatorMatches -Text $searchText -IndicatorRules $indicatorRules
+            if (-not $matchResult.IsMatch) { continue }
+
+            # Skip self-references (scanner detecting itself in logs)
+            $isSelfReference = $false
+            foreach ($ex in $excludePatterns) {
+                if ($searchText -match $ex) { $isSelfReference = $true; break }
+            }
+            if ($isSelfReference) { continue }
+
+            $dataMap = Get-EventDataMap -EventRecord $e
+            $contextSource = if (-not [string]::IsNullOrWhiteSpace($msg)) { $msg } else { $xml }
+            $contextSnippets = @()
+
+            foreach ($hit in $matchResult.All) {
+                $pat = [string]$hit.Regex
+                if ($contextSource -and $contextSource -match "(.{0,70}$pat.{0,70})") {
+                    $snippet = $Matches[1] -replace '[\r\n]+', ' '
+                    $snippet = $snippet.Trim()
+                    if ($snippet.Length -gt 150) { $snippet = $snippet.Substring(0, 150) + "..." }
+                    if ($snippet -and $snippet -notin $contextSnippets) {
+                        $contextSnippets += $snippet
+                    }
+                }
+                if ($contextSnippets.Count -ge 3) { break }
+            }
+
+            # Build clean, structured output
+            $matchedStr = (@($matchResult.All | Select-Object -ExpandProperty Name -Unique) -join ", ")
+            $contextStr = if ($contextSnippets.Count -gt 0) {
+                ($contextSnippets -join " | ")
+            }
+            else { "[context extraction failed]" }
+
+            $preferredFields = @(
+                "CommandLine", "Image", "ParentImage", "ProcessId", "ParentProcessId",
+                "TaskName", "ActionName", "Path", "ServiceName", "ServiceFileName",
+                "QueryName", "DestinationIp", "DestinationHostname", "ScriptBlockText"
+            )
+            $eventDataSummary = New-Object System.Collections.Generic.List[string]
+            foreach ($k in $preferredFields) {
+                if ($dataMap.Contains($k)) {
+                    $v = [string]$dataMap[$k]
+                    if ($v.Length -gt 140) { $v = $v.Substring(0, 140) + "..." }
+                    $eventDataSummary.Add("$k=$v")
+                }
+                if ($eventDataSummary.Count -ge 6) { break }
+            }
+            if ($eventDataSummary.Count -eq 0 -and $dataMap.Count -gt 0) {
+                foreach ($kv in $dataMap.GetEnumerator()) {
+                    $v = [string]$kv.Value
+                    if ($v.Length -gt 120) { $v = $v.Substring(0, 120) + "..." }
+                    $eventDataSummary.Add("$($kv.Key)=$v")
+                    if ($eventDataSummary.Count -ge 4) { break }
+                }
+            }
+
+            $messagePreview = [string]$msg
+            $messagePreview = $messagePreview -replace '[\r\n]+', ' '
+            if ($messagePreview.Length -gt 260) { $messagePreview = $messagePreview.Substring(0, 260) + "..." }
+
+            $confidence = if ($matchResult.Strong.Count -gt 0) { "Strong" } else { "Correlated" }
+            $sev = if ($matchResult.Strong.Count -gt 0) { "HIGH" } else { "MEDIUM" }
+
+            # Structured details for JSON
+            $details = "EventTime: $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | EventId: $($e.Id) | Log: $logName | Provider: $($e.ProviderName) | Level: $($e.LevelDisplayName) | Confidence: $confidence | MatchedIndicators: $matchedStr | EventData: $($eventDataSummary -join '; ') | Context: $contextStr | MessageSample: $messagePreview"
+
+            # Shorter display for console
+            $displayDetails = "Time: $($e.TimeCreated.ToString('HH:mm:ss')) | $confidence | Matched: $matchedStr"
+
+            Write-Finding -Severity $sev -Category "Event Log" `
+                -Message "Suspicious pattern match in $logName (ID: $($e.Id))" `
+                -Details $details `
+                -DisplayDetails $displayDetails
+
+            $findingsInLog++
         }
     }
 }
@@ -1399,6 +1628,7 @@ function Test-ServicePersistence {
 # ============================================================================
 
 $IsAdminContext = Test-IsAdministrator
+$IsRemoteSession = $null -ne $PSSenderInfo
 
 $headerLine = "=" * 70
 if (-not $Quiet) {
@@ -1414,6 +1644,9 @@ if (-not $Quiet) {
 
     if (-not $IsAdminContext) {
         Write-Host "`n[WARN] Running without admin - service and some registry checks may be incomplete" -ForegroundColor Yellow
+    }
+    if ($IsRemoteSession) {
+        Write-Host "[INFO] Running via PowerShell Remoting session" -ForegroundColor DarkGray
     }
 }
 
@@ -1500,42 +1733,9 @@ if (-not $Quiet) {
     }
 }
 
-# Output path sanity
+# Optional export (no disk writes unless explicitly requested)
 $script:CurrentCheckId = 0
 $script:CurrentCheckName = "Export"
-$fallbackUsed = $false
-
-try {
-    if (-not (Test-Path -Path $OutputPath -PathType Container)) {
-        # Create output dir if user provided non-existing path (script already writes report artifacts)
-        New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
-    }
-}
-catch {
-    $fallbackCandidates = @(
-        "$env:USERPROFILE\Desktop",
-        $PSScriptRoot,
-        (Get-Location).Path
-    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
-
-    foreach ($candidate in $fallbackCandidates) {
-        try {
-            if (-not (Test-Path -Path $candidate -PathType Container)) {
-                New-Item -Path $candidate -ItemType Directory -Force | Out-Null
-            }
-            $OutputPath = $candidate
-            $fallbackUsed = $true
-            break
-        }
-        catch {}
-    }
-}
-
-if ($fallbackUsed) {
-    if (-not $Quiet) {
-        Write-Host "[INFO] Requested output path was not writable; fallback path selected: $OutputPath" -ForegroundColor DarkYellow
-    }
-}
 
 $reportCritical = ($Findings | Where-Object { $_.Severity -eq "CRITICAL" }).Count
 $reportHigh = ($Findings | Where-Object { $_.Severity -eq "HIGH" }).Count
@@ -1543,47 +1743,95 @@ $reportMedium = ($Findings | Where-Object { $_.Severity -eq "MEDIUM" }).Count
 $reportLow = ($Findings | Where-Object { $_.Severity -eq "LOW" }).Count
 $reportInfo = ($Findings | Where-Object { $_.Severity -eq "INFO" }).Count
 
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$jsonPath = Join-Path -Path $OutputPath -ChildPath "ChrysalisScan_$stamp.json"
-
-try {
-    $report = [ordered]@{
-        ReportVersion = $ScriptVersion
-        ScanId        = $ScanId
-        ScanInfo      = [ordered]@{
-            Computer          = $env:COMPUTERNAME
-            User              = $env:USERNAME
-            OSVersion         = [System.Environment]::OSVersion.VersionString
-            PowerShellVersion = $PSVersionTable.PSVersion.ToString()
-            IsAdministrator   = $IsAdminContext
-            StartTime         = $ScanStartTime.ToString("o")
-            EndTime           = $ScanEndTime.ToString("o")
-            DurationSeconds   = [Math]::Round($Duration.TotalSeconds, 2)
-        }
-        ScanSettings  = [ordered]@{
-            OutputPath = $OutputPath
-            DeepScan   = [bool]$DeepScan
-            ExportCSV  = [bool]$ExportCSV
-            Quiet      = [bool]$Quiet
-        }
-        Summary       = [ordered]@{
-            Critical = $reportCritical
-            High     = $reportHigh
-            Medium   = $reportMedium
-            Low      = $reportLow
-            Info     = $reportInfo
-            Total    = $Findings.Count
-        }
-        CheckSummary  = $CheckSummary
-        Findings      = $Findings
+$report = [ordered]@{
+    ReportVersion = $ScriptVersion
+    ScanId        = $ScanId
+    ScanInfo      = [ordered]@{
+        Computer          = $env:COMPUTERNAME
+        User              = $env:USERNAME
+        OSVersion         = [System.Environment]::OSVersion.VersionString
+        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+        IsAdministrator   = $IsAdminContext
+        IsRemoteSession   = $IsRemoteSession
+        StartTime         = $ScanStartTime.ToString("o")
+        EndTime           = $ScanEndTime.ToString("o")
+        DurationSeconds   = [Math]::Round($Duration.TotalSeconds, 2)
     }
-
-    $report | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
-
-    if (-not $Quiet) { Write-Host "JSON report: $jsonPath" -ForegroundColor Green }
+    ScanSettings  = [ordered]@{
+        OutputPath = $OutputPath
+        DeepScan   = [bool]$DeepScan
+        ExportJSON = [bool]$ExportJSON
+        ExportCSV  = [bool]$ExportCSV
+        Quiet      = [bool]$Quiet
+    }
+    Summary       = [ordered]@{
+        Critical = $reportCritical
+        High     = $reportHigh
+        Medium   = $reportMedium
+        Low      = $reportLow
+        Info     = $reportInfo
+        Total    = $Findings.Count
+    }
+    CheckSummary  = $CheckSummary
+    Findings      = $Findings
 }
-catch {
-    Write-Finding -Severity "INFO" -Category "Export" -Message "Could not write JSON report" -Details $_.Exception.Message
+
+$shouldExportToDisk = [bool]$ExportJSON -or [bool]$ExportCSV
+if (-not $shouldExportToDisk) {
+    if (-not $Quiet) {
+        Write-Host "[INFO] No report file written. Use -ExportJSON and/or -ExportCSV to export results." -ForegroundColor DarkGray
+    }
+    return $Findings
+}
+
+$requestedOutputPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) { Get-DefaultOutputPath } else { $OutputPath }
+$fallbackUsed = $false
+$outputReady = $false
+
+$fallbackCandidates = @(
+    $requestedOutputPath,
+    (Get-DefaultOutputPath),
+    $PSScriptRoot,
+    (Get-Location).Path
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+foreach ($candidate in $fallbackCandidates) {
+    try {
+        if (-not (Test-Path -Path $candidate -PathType Container)) {
+            New-Item -Path $candidate -ItemType Directory -Force | Out-Null
+        }
+        if (Test-Path -Path $candidate -PathType Container) {
+            $OutputPath = $candidate
+            $outputReady = $true
+            $fallbackUsed = (Expand-Normalize $candidate) -ne (Expand-Normalize $requestedOutputPath)
+            break
+        }
+    }
+    catch {}
+}
+
+if (-not $outputReady) {
+    Write-Finding -Severity "INFO" -Category "Export" `
+        -Message "Could not prepare a writable output path; report export skipped" `
+        -Details "RequestedOutputPath: $requestedOutputPath"
+    return $Findings
+}
+
+if ($fallbackUsed -and -not $Quiet) {
+    Write-Host "[INFO] Requested output path was not writable; fallback path selected: $OutputPath" -ForegroundColor DarkYellow
+}
+
+$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+if ($ExportJSON) {
+    $jsonPath = Join-Path -Path $OutputPath -ChildPath "ChrysalisScan_$stamp.json"
+    try {
+        $report | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
+        if (-not $Quiet) { Write-Host "JSON report: $jsonPath" -ForegroundColor Green }
+    }
+    catch {
+        Write-Finding -Severity "INFO" -Category "Export" -Message "Could not write JSON report" -Details $_.Exception.Message
+    }
 }
 
 if ($ExportCSV) {
