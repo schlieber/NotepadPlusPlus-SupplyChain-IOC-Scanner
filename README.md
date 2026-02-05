@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/schlieber/NotepadPlusPlus-SupplyChain-IOC-Scanner/main/assets/hero-banner-notepadpp-chrysalis.jpg" alt="Notepad++ Supply Chain IOC Scanner hero banner" width="100%">
+</p>
+
 # Notepad++ Supply Chain IOC Scanner (Detect CVE-2025-15556 & Chrysalis)
 
 **Notepad++ Supply Chain Attack IoC Scanner | Chrysalis Backdoor Detection | Lotus Blossom APT Malware Scanner | CVE-2025-15556**
