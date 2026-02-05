@@ -19,6 +19,7 @@ A **read-only, non-destructive PowerShell scanner** that detects **Indicators of
 - ✅ **Zero installation** — single PowerShell script
 - ✅ **Non-destructive** — read-only, no system modifications
 - ✅ **False-positive aware** — intelligent scoring minimizes noise
+- ✅ **Portable-aware** — detects Notepad++ outside default install folders
 - ✅ **Incident response ready** — JSON/CSV export for SIEM integration
 - ✅ **Comprehensive** — 16 detection checks covering all 3 infection chains
 
@@ -38,7 +39,7 @@ A **read-only, non-destructive PowerShell scanner** that detects **Indicators of
 | 8 | **Registry Persistence** | Run/RunOnce keys with legitimate updater allowlist |
 | 9 | **Scheduled Tasks** | Task action path analysis |
 | 10 | **Hosts File** | C2 domain entries (blocking-aware detection) |
-| 11 | **Notepad++ Signature** | Binary and GUP.exe Authenticode validation |
+| 11 | **Notepad++ Discovery + Signature** | Multi-source install discovery + Notepad++/GUP.exe Authenticode validation |
 | 12 | **Exfil Artifacts** | Recon staging files (1.txt, a.txt, u.bat) |
 | 13 | **Event Log Analysis** | PowerShell & Application log pattern matching |
 | 14 | **Entropy Detection** | Packed/obfuscated files (Shannon entropy > 7.2) |
@@ -107,6 +108,27 @@ With `-ExportCSV`, also generates:
 ```
 ChrysalisScan_20260204_143052.csv
 ```
+
+### Report Structure (JSON)
+
+The JSON report now includes:
+
+- `ReportVersion` and `ScanId` for case tracking
+- `ScanInfo` (host context, PowerShell version, admin context, timing)
+- `ScanSettings` (flags used for the scan)
+- `Summary` (severity totals)
+- `CheckSummary` (all 16 checks, start/end timestamps, finding count)
+- `Findings` with per-finding `CheckId`/`CheckName` context
+
+### Notepad++ Install Discovery Sources
+
+Check #11 detects `notepad++.exe` from multiple locations, not just default folders:
+
+- Standard install paths (`Program Files`, `Program Files (x86)`)
+- Per-user and package paths (e.g. Scoop/Chocolatey/common portable paths)
+- Registry `App Paths` and `Uninstall` metadata
+- Running process executable path
+- `PATH` command resolution
 
 ### Severity Levels
 

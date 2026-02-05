@@ -28,7 +28,7 @@
       8.  Registry Run/RunOnce with legitimate updater allowlist
       9.  Scheduled task action path analysis
       10. Hosts file C2 domains (blocking-aware)
-      11. Notepad++ and GUP.exe Authenticode signature validation
+      11. Notepad++ install discovery + Notepad++/GUP.exe signature validation
       12. Exfil staging artifacts (1.txt, a.txt, u.bat)
       13. Windows Event Log pattern matching
       14. High-entropy file detection (Shannon > 7.2)
@@ -68,7 +68,7 @@
     Run without changing system execution policy.
 
 .NOTES
-    Version    : 1.0.0.1
+    Version    : 1.1.0
     Author     : Simon Schlieber (@schlieber)
     Repository : https://github.com/schlieber/NotepadPlusPlus-SupplyChain-IOC-Scanner
     Date       : February 2026
@@ -222,7 +222,12 @@ $SuspiciousCommands = @(
 # ============================================================================
 
 $Findings = [System.Collections.ArrayList]::new()
+$CheckExecution = [ordered]@{}
 $ScanStartTime = Get-Date
+$ScanId = [guid]::NewGuid().Guid
+$ScriptVersion = "1.1.0"
+$script:CurrentCheckId = 0
+$script:CurrentCheckName = "General"
 
 # ============================================================================
 # HELPERS
@@ -230,8 +235,39 @@ $ScanStartTime = Get-Date
 
 function Write-CheckHeader {
     param([int]$Index, [string]$Text)
+
+    Complete-CurrentCheck
+    $script:CurrentCheckId = $Index
+    $script:CurrentCheckName = $Text
+
+    $checkKey = [string]$Index
+    if (-not $CheckExecution.Contains($checkKey)) {
+        $CheckExecution[$checkKey] = [ordered]@{
+            CheckId      = $Index
+            CheckName    = $Text
+            StartedAt    = (Get-Date).ToString("o")
+            CompletedAt  = $null
+            FindingCount = 0
+        }
+    }
+    else {
+        $CheckExecution[$checkKey].CheckName = $Text
+        if (-not $CheckExecution[$checkKey].StartedAt) {
+            $CheckExecution[$checkKey].StartedAt = (Get-Date).ToString("o")
+        }
+    }
+
     if (-not $Quiet) {
         Write-Host "`n[$Index/$TotalChecks] $Text" -ForegroundColor Green
+    }
+}
+
+function Complete-CurrentCheck {
+    if ($script:CurrentCheckId -le 0) { return }
+
+    $checkKey = [string]$script:CurrentCheckId
+    if ($CheckExecution.Contains($checkKey) -and -not $CheckExecution[$checkKey].CompletedAt) {
+        $CheckExecution[$checkKey].CompletedAt = (Get-Date).ToString("o")
     }
 }
 
@@ -256,6 +292,15 @@ function Write-Finding {
     # Use DisplayDetails for console if provided, otherwise use Details
     $consoleDetails = if ($DisplayDetails) { $DisplayDetails } else { $Details }
 
+    $findingCheckId = $script:CurrentCheckId
+    $findingCheckName = $script:CurrentCheckName
+    if ($findingCheckId -gt 0) {
+        $checkKey = [string]$findingCheckId
+        if ($CheckExecution.Contains($checkKey)) {
+            $CheckExecution[$checkKey].FindingCount++
+        }
+    }
+
     if (-not $Quiet) {
         Write-Host "  [$Severity] " -ForegroundColor $color -NoNewline
         Write-Host "$Category - " -ForegroundColor White -NoNewline
@@ -268,6 +313,9 @@ function Write-Finding {
     # Always store full Details in the findings (for JSON/CSV export)
     [void]$Findings.Add([PSCustomObject]@{
             Timestamp    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            ScanId       = $ScanId
+            CheckId      = $findingCheckId
+            CheckName    = $findingCheckName
             Severity     = $Severity
             Category     = $Category
             Message      = $Message
@@ -282,6 +330,160 @@ function Expand-Normalize {
     $v = $Value.Trim().Trim('"')
     try { $v = [Environment]::ExpandEnvironmentVariables($v) } catch {}
     return $v.ToLowerInvariant()
+}
+
+function Resolve-ExecutablePath {
+    param(
+        [string]$Value,
+        [switch]$TreatAsDirectory
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    $v = $Value.Trim()
+    try { $v = [Environment]::ExpandEnvironmentVariables($v) } catch {}
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+
+    if ($TreatAsDirectory) {
+        $dir = $v.Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($dir)) { return $null }
+        $v = Join-Path -Path $dir -ChildPath "notepad++.exe"
+    }
+    else {
+        if ($v -match '^\s*"([^"]+)"') {
+            $v = $Matches[1]
+        }
+        elseif ($v -match '^\s*([^,]+?\.exe)\s*(,.*)?$') {
+            $v = $Matches[1]
+        }
+        elseif ($v -match '^\s*([^\s]+\.exe)') {
+            $v = $Matches[1]
+        }
+
+        $v = $v.Trim().Trim('"')
+        $v = $v -replace ',\s*\d+$', ''
+    }
+
+    if ($v -notmatch '(?i)notepad\+\+\.exe$') { return $null }
+
+    try {
+        return (Resolve-Path -Path $v -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Path)
+    }
+    catch {
+        if (Test-Path -Path $v -PathType Leaf) { return $v }
+    }
+    return $null
+}
+
+function Get-NotepadInstallCandidates {
+    $candidateMap = [ordered]@{}
+
+    function Add-NotepadCandidate {
+        param(
+            [string]$RawValue,
+            [string]$Source,
+            [switch]$TreatAsDirectory
+        )
+
+        $resolved = Resolve-ExecutablePath -Value $RawValue -TreatAsDirectory:$TreatAsDirectory
+        if (-not $resolved) { return }
+
+        $key = Expand-Normalize $resolved
+        if (-not $candidateMap.Contains($key)) {
+            $candidateMap[$key] = [ordered]@{
+                Path             = $resolved
+                InstallDirectory = (Split-Path -Path $resolved -Parent)
+                Sources          = [System.Collections.ArrayList]::new()
+            }
+        }
+
+        if (-not $candidateMap[$key].Sources.Contains($Source)) {
+            [void]$candidateMap[$key].Sources.Add($Source)
+        }
+    }
+
+    Add-NotepadCandidate -RawValue "${env:ProgramFiles}\Notepad++\notepad++.exe" -Source "Standard path (ProgramFiles)"
+    Add-NotepadCandidate -RawValue "${env:ProgramFiles(x86)}\Notepad++\notepad++.exe" -Source "Standard path (ProgramFiles x86)"
+    Add-NotepadCandidate -RawValue "$env:LOCALAPPDATA\Programs\Notepad++\notepad++.exe" -Source "Common per-user install path"
+    Add-NotepadCandidate -RawValue "$env:USERPROFILE\scoop\apps\notepadplusplus\current\notepad++.exe" -Source "Scoop path (user profile)"
+    Add-NotepadCandidate -RawValue "$env:SCOOP\apps\notepadplusplus\current\notepad++.exe" -Source "Scoop path (SCOOP env var)"
+    Add-NotepadCandidate -RawValue "$env:ChocolateyInstall\lib\notepadplusplus\tools\notepad++.exe" -Source "Chocolatey package path"
+
+    $appPathKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\notepad++.exe",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\notepad++.exe",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\notepad++.exe",
+        "HKCU:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\notepad++.exe"
+    )
+
+    foreach ($rk in $appPathKeys) {
+        try {
+            if (-not (Test-Path -Path $rk)) { continue }
+            $keyObj = Get-Item -Path $rk -ErrorAction SilentlyContinue
+            if (-not $keyObj) { continue }
+
+            Add-NotepadCandidate -RawValue ([string]$keyObj.GetValue("")) -Source "Registry App Paths default: $rk"
+            Add-NotepadCandidate -RawValue ([string]$keyObj.GetValue("Path")) -Source "Registry App Paths path: $rk" -TreatAsDirectory
+        }
+        catch {}
+    }
+
+    $uninstallRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKCU:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+
+    foreach ($root in $uninstallRoots) {
+        try {
+            if (-not (Test-Path -Path $root)) { continue }
+            Get-ItemProperty -Path "$root\*" -ErrorAction SilentlyContinue | ForEach-Object {
+                $displayName = [string]$_.DisplayName
+                if ([string]::IsNullOrWhiteSpace($displayName) -or $displayName -notmatch '(?i)^notepad\+\+') { return }
+
+                Add-NotepadCandidate -RawValue ([string]$_.DisplayIcon) -Source "Uninstall DisplayIcon: $root"
+                Add-NotepadCandidate -RawValue ([string]$_.InstallLocation) -Source "Uninstall InstallLocation: $root" -TreatAsDirectory
+            }
+        }
+        catch {}
+    }
+
+    try {
+        Get-Process -Name "notepad++" -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.Path) {
+                Add-NotepadCandidate -RawValue ([string]$_.Path) -Source "Running process path"
+            }
+        }
+    }
+    catch {}
+
+    try {
+        $cmd = Get-Command -Name "notepad++.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd -and $cmd.Source) {
+            Add-NotepadCandidate -RawValue ([string]$cmd.Source) -Source "PATH lookup"
+        }
+    }
+    catch {}
+
+    $results = foreach ($entry in $candidateMap.Values) {
+        [PSCustomObject]@{
+            Path             = $entry.Path
+            InstallDirectory = $entry.InstallDirectory
+            Source           = ($entry.Sources -join "; ")
+        }
+    }
+
+    return $results | Sort-Object -Property Path
+}
+
+function Test-IsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch { return $false }
 }
 
 function Get-SafeFileHash {
@@ -466,14 +668,34 @@ function Test-DropDirectories {
         }
     }
 
-    # NSIS runtime temp dirs: common in legit software too -> keep INFO
+    # NSIS runtime temp dirs are common; only log if campaign-relevant names are present.
     $nsisDirs = Get-ChildItem -Path "$env:LOCALAPPDATA\Temp" -Directory -Force -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -match '^ns.*\.tmp$' -or $_.Name -eq 'ns.tmp' }
 
+    $nsisIndicators = @(
+        "update.exe",
+        "[NSIS].nsi",
+        "BluetoothService.exe",
+        "u.bat",
+        "log.dll"
+    )
+    $nsisHitCount = 0
+
     foreach ($d in $nsisDirs) {
-        Write-Finding -Severity "INFO" -Category "NSIS" `
-            -Message "NSIS temp directory detected (non-confirmatory): $($d.Name)" `
-            -Details "Path: $($d.FullName) | NSIS is common; correlate with other IoCs"
+        $hits = Get-ChildItem -Path $d.FullName -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $nsisIndicators -contains $_.Name } |
+        Select-Object -ExpandProperty Name -Unique
+
+        if ($hits -and $hits.Count -gt 0) {
+            $nsisHitCount++
+            Write-Finding -Severity "INFO" -Category "NSIS" `
+                -Message "NSIS temp directory contains campaign-relevant filename(s)" `
+                -Details "Path: $($d.FullName) | Hits: $($hits -join ', ')"
+        }
+    }
+
+    if ($nsisDirs -and -not $Quiet -and $nsisHitCount -eq 0) {
+        Write-Host "  [OK] NSIS temp directories found, but no campaign-relevant filenames observed" -ForegroundColor Gray
     }
 }
 
@@ -788,30 +1010,34 @@ function Test-HostsFile {
 }
 
 function Test-NotepadVersion {
-    Write-CheckHeader 11 "Notepad++ installation + signature sanity..."
+    Write-CheckHeader 11 "Notepad++ install discovery + signature sanity..."
 
-    $nppExe = @(
-        "${env:ProgramFiles}\Notepad++\notepad++.exe",
-        "${env:ProgramFiles(x86)}\Notepad++\notepad++.exe"
-    ) | Where-Object { Test-Path $_ }
+    $nppExe = Get-NotepadInstallCandidates
 
-    if (-not $nppExe) {
-        if (-not $Quiet) { Write-Host "  [OK] Notepad++ not found in standard locations" -ForegroundColor Gray }
+    if (-not $nppExe -or $nppExe.Count -eq 0) {
+        if (-not $Quiet) { Write-Host "  [OK] Notepad++ not found in discovered install locations" -ForegroundColor Gray }
         return
     }
 
-    foreach ($path in $nppExe) {
-        $vi = (Get-Item -Path $path).VersionInfo
+    foreach ($candidate in $nppExe) {
+        $path = $candidate.Path
+        $source = $candidate.Source
+        $installDir = $candidate.InstallDirectory
+
+        $vi = $null
+        try { $vi = (Get-Item -Path $path -ErrorAction Stop).VersionInfo } catch {}
+
         Write-Finding -Severity "INFO" -Category "Notepad++" `
-            -Message "Found Notepad++ binary" `
-            -Details "Path: $path | Version: $($vi.FileVersion)"
+            -Message "Detected Notepad++ installation candidate" `
+            -Details "Path: $path | InstallDir: $installDir | Version: $($vi.FileVersion) | Source: $source"
 
         try {
             $sig = Get-AuthenticodeSignature -FilePath $path -ErrorAction Stop
             $sev = if ($sig.Status -eq 'Valid') { "INFO" } else { "MEDIUM" }
+            $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "[no signer certificate]" }
             Write-Finding -Severity $sev -Category "Signature" `
                 -Message "Authenticode signature status: $($sig.Status)" `
-                -Details "File: $path | Subject: $($sig.SignerCertificate.Subject)"
+                -Details "File: $path | Subject: $subject"
         }
         catch {
             Write-Finding -Severity "INFO" -Category "Signature" `
@@ -825,9 +1051,10 @@ function Test-NotepadVersion {
             try {
                 $sig2 = Get-AuthenticodeSignature -FilePath $gupPath -ErrorAction Stop
                 $sev2 = if ($sig2.Status -eq 'Valid') { "INFO" } else { "MEDIUM" }
+                $subject2 = if ($sig2.SignerCertificate) { $sig2.SignerCertificate.Subject } else { "[no signer certificate]" }
                 Write-Finding -Severity $sev2 -Category "Signature" `
                     -Message "GUP.exe signature status: $($sig2.Status)" `
-                    -Details "File: $gupPath | Subject: $($sig2.SignerCertificate.Subject)"
+                    -Details "File: $gupPath | Subject: $subject2"
             }
             catch {}
         }
@@ -900,6 +1127,7 @@ function Test-EventLogs {
 
             foreach ($e in $events) {
                 $msg = $e.Message
+                if ([string]::IsNullOrWhiteSpace($msg)) { continue }
 
                 # Skip self-references (scanner detecting itself in logs)
                 $isSelfReference = $false
@@ -1063,6 +1291,7 @@ Test-EventLogs
 Test-HighEntropyFiles
 Test-FileContents
 Test-ServicePersistence
+Complete-CurrentCheck
 
 # ============================================================================
 # SUMMARY + EXPORT
@@ -1076,6 +1305,20 @@ $High = ($Findings | Where-Object { $_.Severity -eq "HIGH" }).Count
 $Medium = ($Findings | Where-Object { $_.Severity -eq "MEDIUM" }).Count
 $Low = ($Findings | Where-Object { $_.Severity -eq "LOW" }).Count
 $Info = ($Findings | Where-Object { $_.Severity -eq "INFO" }).Count
+$CheckSummary = @(
+    $CheckExecution.GetEnumerator() |
+    Sort-Object { [int]$_.Key } |
+    ForEach-Object {
+        [PSCustomObject]@{
+            CheckId      = $_.Value.CheckId
+            CheckName    = $_.Value.CheckName
+            StartedAt    = $_.Value.StartedAt
+            CompletedAt  = $_.Value.CompletedAt
+            FindingCount = $_.Value.FindingCount
+            Status       = if ($_.Value.FindingCount -gt 0) { "Findings present" } else { "No findings recorded" }
+        }
+    }
+)
 
 if (-not $Quiet) {
     Write-Host "`n" + ("=" * 60) -ForegroundColor Cyan
@@ -1115,6 +1358,10 @@ if (-not $Quiet) {
 }
 
 # Output path sanity
+$script:CurrentCheckId = 0
+$script:CurrentCheckName = "Export"
+$fallbackUsed = $false
+
 try {
     if (-not (Test-Path -Path $OutputPath -PathType Container)) {
         # Create output dir if user provided non-existing path (script already writes report artifacts)
@@ -1122,32 +1369,73 @@ try {
     }
 }
 catch {
-    # Fallback to Desktop
-    $OutputPath = "$env:USERPROFILE\Desktop"
+    $fallbackCandidates = @(
+        "$env:USERPROFILE\Desktop",
+        $PSScriptRoot,
+        (Get-Location).Path
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+    foreach ($candidate in $fallbackCandidates) {
+        try {
+            if (-not (Test-Path -Path $candidate -PathType Container)) {
+                New-Item -Path $candidate -ItemType Directory -Force | Out-Null
+            }
+            $OutputPath = $candidate
+            $fallbackUsed = $true
+            break
+        }
+        catch {}
+    }
 }
+
+if ($fallbackUsed) {
+    if (-not $Quiet) {
+        Write-Host "[INFO] Requested output path was not writable; fallback path selected: $OutputPath" -ForegroundColor DarkYellow
+    }
+}
+
+$reportCritical = ($Findings | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+$reportHigh = ($Findings | Where-Object { $_.Severity -eq "HIGH" }).Count
+$reportMedium = ($Findings | Where-Object { $_.Severity -eq "MEDIUM" }).Count
+$reportLow = ($Findings | Where-Object { $_.Severity -eq "LOW" }).Count
+$reportInfo = ($Findings | Where-Object { $_.Severity -eq "INFO" }).Count
 
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $jsonPath = Join-Path -Path $OutputPath -ChildPath "ChrysalisScan_$stamp.json"
 
 try {
-    @{
-        ScanInfo = @{
-            Computer  = $env:COMPUTERNAME
-            User      = $env:USERNAME
-            StartTime = $ScanStartTime.ToString("o")
-            EndTime   = $ScanEndTime.ToString("o")
-            Duration  = $Duration.TotalSeconds
+    $report = [ordered]@{
+        ReportVersion = $ScriptVersion
+        ScanId        = $ScanId
+        ScanInfo      = [ordered]@{
+            Computer          = $env:COMPUTERNAME
+            User              = $env:USERNAME
+            OSVersion         = [System.Environment]::OSVersion.VersionString
+            PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+            IsAdministrator   = (Test-IsAdministrator)
+            StartTime         = $ScanStartTime.ToString("o")
+            EndTime           = $ScanEndTime.ToString("o")
+            DurationSeconds   = [Math]::Round($Duration.TotalSeconds, 2)
         }
-        Summary  = @{
-            Critical = $Critical
-            High     = $High
-            Medium   = $Medium
-            Low      = $Low
-            Info     = $Info
+        ScanSettings  = [ordered]@{
+            OutputPath = $OutputPath
+            DeepScan   = [bool]$DeepScan
+            ExportCSV  = [bool]$ExportCSV
+            Quiet      = [bool]$Quiet
+        }
+        Summary       = [ordered]@{
+            Critical = $reportCritical
+            High     = $reportHigh
+            Medium   = $reportMedium
+            Low      = $reportLow
+            Info     = $reportInfo
             Total    = $Findings.Count
         }
-        Findings = $Findings
-    } | ConvertTo-Json -Depth 6 | Out-File -FilePath $jsonPath -Encoding UTF8
+        CheckSummary  = $CheckSummary
+        Findings      = $Findings
+    }
+
+    $report | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
 
     if (-not $Quiet) { Write-Host "JSON report: $jsonPath" -ForegroundColor Green }
 }
