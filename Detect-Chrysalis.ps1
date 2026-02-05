@@ -68,7 +68,7 @@
     Run without changing system execution policy.
 
 .NOTES
-    Version    : 1.1.0
+    Version    : 1.1.1
     Author     : Simon Schlieber (@schlieber)
     Repository : https://github.com/schlieber/NotepadPlusPlus-SupplyChain-IOC-Scanner
     Date       : February 2026
@@ -77,6 +77,10 @@
     IoC Sources:
     - Rapid7 Labs: "The Chrysalis Backdoor: A Deep Dive into Lotus Blossom's toolkit"
     - Kaspersky GReAT: "Notepad++ Supply Chain Attack Analysis"
+    - signature-base filename IoC rules (selected path patterns)
+      https://github.com/Neo23x0/signature-base/blob/master/iocs/filename-iocs.txt
+    - signature-base license reference
+      https://github.com/Neo23x0/signature-base/blob/master/LICENSE
 
     MITRE ATT&CK Techniques:
     - T1195.002 - Supply Chain Compromise: Compromise Software Supply Chain
@@ -106,6 +110,12 @@
 
 .LINK
     https://attack.mitre.org/groups/G0030/
+
+.LINK
+    https://github.com/Neo23x0/signature-base/blob/master/iocs/filename-iocs.txt
+
+.LINK
+    https://github.com/Neo23x0/signature-base/blob/master/LICENSE
 #>
 
 [CmdletBinding()]
@@ -130,7 +140,16 @@ $DropDirs = @{
 }
 
 # USOShared is legitimate. We only look for SPECIFIC artifacts (Rapid7).
-$USOSharedPath = "C:\ProgramData\USOShared"
+$ProgramDataRoot = if ($env:ProgramData) { $env:ProgramData } elseif ($env:ALLUSERSPROFILE) { $env:ALLUSERSPROFILE } else { $null }
+if (-not $ProgramDataRoot) {
+    $ProgramDataRoot = if ($env:windir) { Join-Path $env:windir "..\ProgramData" } else { $PSScriptRoot }
+}
+try {
+    $USOSharedPath = Join-Path $ProgramDataRoot "USOShared"
+}
+catch {
+    $USOSharedPath = "$ProgramDataRoot/USOShared"
+}
 $USOSharedMaliciousFiles = @("conf.c", "libtcc.dll", "svchost.exe")
 
 # Known malicious update deployment filenames (existence != malicious; hash/location matters)
@@ -156,6 +175,15 @@ $MaliciousDomains = @(
     "temp.sh"
 )
 
+# Observed malicious update delivery URLs from public incident reporting.
+$MaliciousUpdateURLs = @(
+    "http://45.76.155.202/update/update.exe",
+    "http://45.32.144.255/update/update.exe",
+    "http://95.179.213.0/update/update.exe",
+    "http://95.179.213.0/update/install.exe",
+    "http://95.179.213.0/update/AutoUpdater.exe"
+)
+
 # Hash indicators (Rapid7, Kaspersky)
 $MaliciousSHA256 = @{
     "a511be5164dc1122fb5a7daa3eef9467e43d8458425b15a640235796006590c9" = "update.exe (NSIS installer)"
@@ -166,12 +194,14 @@ $MaliciousSHA256 = @{
     "9276594e73cda1c69b7d265b3f08dc8fa84bf2d6599086b9acc0bb3745146600" = "u.bat"
     "f4d829739f2d6ba7e3ede83dad428a0ced1a703ec582fc73a4eee3df3704629a" = "conf.c"
     "4a52570eeaf9d27722377865df312e295a7a23c3b6eb991944c2ecd707cc9906" = "libtcc.dll"
+    "831e1ea13a1bd405f5bda2b9d8f2265f7b1db6c668dd2165ccc8a9c4c15ea7dd" = "admin (shellcode/blob)"
     "b4169a831292e245ebdffedd5820584d73b129411546e7d3eccf4663d5fc5be3" = "ConsoleApplication2.exe (Warbird loader)"
     "fcc2765305bcd213b7558025b2039df2265c3e0b6401e4833123c461df2de51a" = "s047t5g.exe (loader)"
     "0a9b8df968df41920b6ff07785cbfebe8bda29e6b512c94a3b2a83d10014d2fd" = "Loader 1"
     "e7cd605568c38bd6e0aba31045e1633205d0598c607a855e2e1bca4cca1c6eda" = "Loader 2"
     "4c2ea8193f4a5db63b897a2d3ce127cc5d89687f380b97a1d91e0c8db542e4f8" = "uffhxpSy (shellcode)"
     "078a9e5c6c787e5532a7e728720cbafee9021bfec4a30e3c2be110748d7c43c5" = "3yZR31VK (shellcode)"
+    "7add554a98d3a99b319f2127688356c1283ed073a084805f14e33b4f6a6126fd" = "system (shellcode/blob)"
 }
 
 $MaliciousSHA1 = @{
@@ -211,6 +241,7 @@ $SuspiciousCommands = @(
     "whoami&&tasklist",
     "whoami&&tasklist&&systeminfo&&netstat -ano",
     "curl.exe -F `"file=@",
+    "curl.exe --user-agent `"https://temp.sh/",
     "-s https://temp.sh/upload",
     "svchost.exe -nostdlib -run",
     "cmd /c whoami >> a.txt",
@@ -219,13 +250,15 @@ $SuspiciousCommands = @(
     "cmd /c netstat -ano >> a.txt"
 )
 
+# Additional path rules mapped from signature-base filename IoCs to Rapid7-described behavior.
+
 # ============================================================================
 
 $Findings = [System.Collections.ArrayList]::new()
 $CheckExecution = [ordered]@{}
 $ScanStartTime = Get-Date
 $ScanId = [guid]::NewGuid().Guid
-$ScriptVersion = "1.1.0"
+$ScriptVersion = "1.1.1"
 $script:CurrentCheckId = 0
 $script:CurrentCheckName = "General"
 
@@ -329,7 +362,7 @@ function Expand-Normalize {
     if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
     $v = $Value.Trim().Trim('"')
     try { $v = [Environment]::ExpandEnvironmentVariables($v) } catch {}
-    return $v.ToLowerInvariant()
+    return ($v -replace '/', '\').ToLowerInvariant()
 }
 
 function Resolve-ExecutablePath {
@@ -575,12 +608,16 @@ function Test-SuspiciousContent {
         'whoami.*tasklist',
         'systeminfo.*netstat',
         'curl\.exe.*temp\.sh',
+        'curl\.exe.*--user-agent.*temp\.sh',
         'temp\.sh/upload',
         'api\.skycloudcenter\.com',
         'api\.wiresguard\.com',
         'cdncheck\.it\.com',
         'safe-dns\.it\.com',
         'self-dns\.it\.com',
+        '45\.76\.155\.202/update/update\.exe',
+        '45\.32\.144\.255/update/update\.exe',
+        '95\.179\.213\.0/update/(update|install|autoupdater)\.exe',
         'gQ2JR&9;',
         'CRAZY',
         'qwhvb\^435h&\*7',
@@ -588,6 +625,12 @@ function Test-SuspiciousContent {
         'Global\\Jdhfv',
         '-nostdlib\s+-run'
     )
+
+    foreach ($u in $MaliciousUpdateURLs) {
+        if (-not [string]::IsNullOrWhiteSpace($u)) {
+            $patterns += [regex]::Escape($u)
+        }
+    }
 
     try {
         $fi = Get-Item -Path $Path -ErrorAction Stop
@@ -620,7 +663,9 @@ function Get-FileIndicatorScore {
     if ($p -match "\\appdata\\roaming\\bluetooth\\bluetoothservice$") { return "CRITICAL" } # shellcode blob
     if ($p -match "\\programdata\\usoshared\\(conf\.c|libtcc\.dll|svchost\.exe)$") { return "CRITICAL" }
     if ($p -match "\\appdata\\roaming\\proshow\\load$") { return "HIGH" }
+    if ($p -match "\\appdata\\roaming\\proshow\\proshow\.exe$") { return "HIGH" } # filename-iocs.txt path rule
     if ($p -match "\\appdata\\roaming\\adobe\\scripts\\alien\.ini$") { return "HIGH" }
+    if ($p -match "\\appdata\\roaming\\adobe\\scripts\\script\.exe$") { return "HIGH" } # filename-iocs.txt path rule
     return "INFO"
 }
 
@@ -630,6 +675,15 @@ function Get-FileIndicatorScore {
 
 function Test-DropDirectories {
     Write-CheckHeader 1 "Checking drop directories (low-FP scoring)..."
+
+    $ruleDetails = @{
+        "Bluetooth|log.dll"              = "\\AppData\\Roaming\\Bluetooth\\log\.dll | Score: 75"
+        "Bluetooth|BluetoothService.exe" = "\\AppData\\Roaming\\Bluetooth\\BluetoothService\.exe | Score: 75"
+        "ProShow|load"                   = "\\AppData\\Roaming\\ProShow\\load$ | Score: 75"
+        "ProShow|ProShow.exe"            = "\\AppData\\Roaming\\ProShow\\ProShow\.exe | Score: 75"
+        "AdobeScripts|alien.ini"         = "\\AppData\\Roaming\\Adobe\\Scripts\\alien\.ini | Score: 75"
+        "AdobeScripts|script.exe"        = "\\AppData\\Roaming\\Adobe\\Scripts\\script.exe | Score: 75"
+    }
 
     foreach ($k in $DropDirs.Keys) {
         $dir = $DropDirs[$k]
@@ -661,9 +715,15 @@ function Test-DropDirectories {
             $fp = Join-Path $dir $n
             if (Test-Path -Path $fp -PathType Leaf) {
                 $baseSev = Get-FileIndicatorScore -FullPath $fp
+                $key = "$k|$n"
+                $details = "Path: $fp"
+                if ($ruleDetails.ContainsKey($key)) {
+                    $details += " | Rule: $($ruleDetails[$key])"
+                }
+
                 Write-Finding -Severity $baseSev -Category "File" `
                     -Message "Suspicious artifact present: $n" `
-                    -Details "Path: $fp"
+                    -Details $details
             }
         }
     }
@@ -675,6 +735,7 @@ function Test-DropDirectories {
     $nsisIndicators = @(
         "update.exe",
         "[NSIS].nsi",
+        "[NSIS.nsi]",
         "BluetoothService.exe",
         "u.bat",
         "log.dll"
@@ -716,10 +777,23 @@ function Test-USOSharedPayloads {
                 -Details "Path: $p | SHA256: $hash"
         }
     }
+
+    # filename-iocs.txt-style path rule: \USOShared\[a-zA-Z0-9]{1,15}\.(c|dll|exe)
+    Get-ChildItem -Path $USOSharedPath -File -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -match '^[a-zA-Z0-9]{1,15}\.(c|dll|exe)$' -and
+        ($USOSharedMaliciousFiles -notcontains $_.Name)
+    } |
+    ForEach-Object {
+        Write-Finding -Severity "HIGH" -Category "Path Rule" `
+            -Message "USOShared file matches Lotus Blossom suspicious-name rule" `
+            -Details "Rule: \\USOShared\\[a-zA-Z0-9]{1,15}\\.(c|dll|exe) | Score: 75 | Path: $($_.FullName)"
+    }
 }
 
 function Test-FileHashes {
     Write-CheckHeader 3 "Hash verification (high-confidence confirmations)..."
+    $libtccLogged = New-Object System.Collections.Generic.HashSet[string]
 
     $scanRoots = @(
         $DropDirs.ProShow,
@@ -743,7 +817,8 @@ function Test-FileHashes {
     $nameSet = New-Object System.Collections.Generic.HashSet[string]
     foreach ($n in ($SuspiciousUpdateNames + @(
                 "BluetoothService.exe", "log.dll", "BluetoothService", "u.bat", "conf.c", "libtcc.dll",
-                "ConsoleApplication2.exe", "s047t5g.exe", "script.exe", "alien.ini", "load", "alien.dll", "lua5.1.dll"
+                "ConsoleApplication2.exe", "s047t5g.exe", "script.exe", "alien.ini", "load", "alien.dll", "lua5.1.dll",
+                "[NSIS].nsi", "[NSIS.nsi]", "admin", "system"
             ))) { [void]$nameSet.Add($n.ToLowerInvariant()) }
 
     foreach ($root in $scanRoots) {
@@ -768,10 +843,45 @@ function Test-FileHashes {
                     return
                 }
 
-                # Name hit without hash match -> INFO only
-                Write-Finding -Severity "INFO" -Category "File" `
-                    -Message "Suspicious filename observed (hash did not match known IoCs): $($_.Name)" `
-                    -Details "Path: $($_.FullName)"
+                if ($_.Name -ieq "libtcc.dll") {
+                    $normalizedPath = Expand-Normalize $_.FullName
+                    if ($normalizedPath -match "\\programdata\\usoshared\\libtcc\.dll$") { return }
+                    if ($libtccLogged.Add($normalizedPath)) {
+                        Write-Finding -Severity "MEDIUM" -Category "Path Rule" `
+                            -Message "libtcc.dll observed (campaign-associated filename)" `
+                            -Details "Rule: \\libtcc\\.dll | Score: 60 | Path: $($_.FullName)"
+                    }
+                }
+                else {
+                    # Name hit without hash match -> INFO only
+                    Write-Finding -Severity "INFO" -Category "File" `
+                        -Message "Suspicious filename observed (hash did not match known IoCs): $($_.Name)" `
+                        -Details "Path: $($_.FullName)"
+                }
+            }
+        }
+        catch {}
+    }
+
+    # Rule coverage backstop for \libtcc\.dll outside targeted filename roots.
+    $libtccBackstopRoots = @(
+        $ProgramDataRoot,
+        "$env:APPDATA",
+        "$env:LOCALAPPDATA",
+        "$env:TEMP"
+    ) | Where-Object { $_ -and (Test-Path -Path $_ -PathType Container) } | Select-Object -Unique
+
+    foreach ($root in $libtccBackstopRoots) {
+        try {
+            Get-ChildItem -Path $root -Recurse -File -Filter "libtcc.dll" -Force -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $normalizedPath = Expand-Normalize $_.FullName
+                if ($normalizedPath -match "\\programdata\\usoshared\\libtcc\.dll$") { return }
+                if (-not $libtccLogged.Add($normalizedPath)) { return }
+
+                Write-Finding -Severity "MEDIUM" -Category "Path Rule" `
+                    -Message "libtcc.dll observed (campaign-associated filename)" `
+                    -Details "Rule: \\libtcc\\.dll | Score: 60 | Path: $($_.FullName)"
             }
         }
         catch {}
@@ -1029,7 +1139,20 @@ function Test-NotepadVersion {
 
         Write-Finding -Severity "INFO" -Category "Notepad++" `
             -Message "Detected Notepad++ installation candidate" `
-            -Details "Path: $path | InstallDir: $installDir | Version: $($vi.FileVersion) | Source: $source"
+            -Details "Path: $path | InstallDir: $installDir | Version: $($vi.FileVersion) | Discovery: $source"
+
+        # Notepad++ project statement: v8.8.9 introduced stronger updater verification.
+        if ($vi -and $vi.FileVersion) {
+            try {
+                $parsed = [version]($vi.FileVersion -replace '[^0-9\.].*$', '')
+                if ($parsed -lt [version]'8.8.9') {
+                    Write-Finding -Severity "MEDIUM" -Category "Notepad++" `
+                        -Message "Notepad++ version predates updater hardening (v8.8.9)" `
+                        -Details "DetectedVersion: $($vi.FileVersion) | Recommendation: upgrade to a current version from the official Notepad++ site"
+                }
+            }
+            catch {}
+        }
 
         try {
             $sig = Get-AuthenticodeSignature -FilePath $path -ErrorAction Stop
@@ -1064,25 +1187,38 @@ function Test-NotepadVersion {
 function Test-ExfilArtifacts {
     Write-CheckHeader 12 "Exfil/recon staging artifacts..."
 
-    $staging = @(
-        (Join-Path $DropDirs.ProShow "1.txt"),
-        (Join-Path $DropDirs.AdobeScripts "a.txt")
+    $ruleTargets = @(
+        @{
+            Path = $DropDirs.ProShow
+            Rule = "\\AppData\\Roaming\\ProShow\\[a-zA-Z0-9]{1}\.txt"
+        },
+        @{
+            Path = $DropDirs.AdobeScripts
+            Rule = "\\AppData\\Roaming\\Adobe\\Scripts\\[a-zA-Z0-9]{1}\.txt"
+        }
     )
 
-    foreach ($p in $staging) {
-        if (Test-Path $p) {
-            $preview = Get-Content -Path $p -First 10 -ErrorAction SilentlyContinue
+    foreach ($target in $ruleTargets) {
+        if (-not (Test-Path -Path $target.Path -PathType Container)) { continue }
+
+        Get-ChildItem -Path $target.Path -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^[a-zA-Z0-9]{1}\.txt$' } |
+        ForEach-Object {
+            $preview = Get-Content -Path $_.FullName -First 15 -ErrorAction SilentlyContinue
             $s = ($preview -join " ")
-            if ($s -match "(whoami|tasklist|systeminfo|netstat)") {
-                Write-Finding -Severity "HIGH" -Category "Exfiltration" `
-                    -Message "Recon output staging file present" `
-                    -Details "Path: $p"
+            $containsRecon = $s -match "(whoami|tasklist|systeminfo|netstat)"
+
+            $sev = if ($containsRecon) { "HIGH" } else { "MEDIUM" }
+            $msg = if ($containsRecon) {
+                "Single-character staging file with recon content detected"
             }
             else {
-                Write-Finding -Severity "INFO" -Category "Exfiltration" `
-                    -Message "Staging filename present (content not obviously recon)" `
-                    -Details "Path: $p"
+                "Single-character staging filename detected (campaign path rule match)"
             }
+
+            Write-Finding -Severity $sev -Category "Exfiltration" `
+                -Message $msg `
+                -Details "Rule: $($target.Rule) | Score: 75 | Path: $($_.FullName)"
         }
     }
 
@@ -1104,7 +1240,7 @@ function Test-EventLogs {
         },
         @{
             LogName = "Application"
-            Pattern = "GUP\.exe|NSIS|notepad\+\+|BluetoothService|ConsoleApplication2"
+            Pattern = "GUP\.exe|NSIS|notepad\+\+|BluetoothService|ConsoleApplication2|AutoUpdater\.exe|install\.exe|update/update\.exe|getDownloadUrl\.php"
         }
     )
 
@@ -1262,6 +1398,8 @@ function Test-ServicePersistence {
 # MAIN
 # ============================================================================
 
+$IsAdminContext = Test-IsAdministrator
+
 $headerLine = "=" * 70
 if (-not $Quiet) {
     Write-Host ""
@@ -1273,6 +1411,10 @@ if (-not $Quiet) {
     Write-Host "  User     : $env:USERNAME" -ForegroundColor White
     Write-Host "  Started  : $ScanStartTime" -ForegroundColor White
     Write-Host $headerLine -ForegroundColor DarkGray
+
+    if (-not $IsAdminContext) {
+        Write-Host "`n[WARN] Running without admin - service and some registry checks may be incomplete" -ForegroundColor Yellow
+    }
 }
 
 Test-DropDirectories
@@ -1354,6 +1496,7 @@ if (-not $Quiet) {
     }
     else {
         Write-Host "`n[OK] No CRITICAL/HIGH indicators detected" -ForegroundColor Green
+        Write-Host "     This scans known IoCs only. Memory-resident or evolved variants require EDR." -ForegroundColor DarkGray
     }
 }
 
@@ -1412,7 +1555,7 @@ try {
             User              = $env:USERNAME
             OSVersion         = [System.Environment]::OSVersion.VersionString
             PowerShellVersion = $PSVersionTable.PSVersion.ToString()
-            IsAdministrator   = (Test-IsAdministrator)
+            IsAdministrator   = $IsAdminContext
             StartTime         = $ScanStartTime.ToString("o")
             EndTime           = $ScanEndTime.ToString("o")
             DurationSeconds   = [Math]::Round($Duration.TotalSeconds, 2)

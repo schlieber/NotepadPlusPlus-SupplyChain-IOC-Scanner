@@ -39,7 +39,7 @@ A **read-only, non-destructive PowerShell scanner** that detects **Indicators of
 | 8 | **Registry Persistence** | Run/RunOnce keys with legitimate updater allowlist |
 | 9 | **Scheduled Tasks** | Task action path analysis |
 | 10 | **Hosts File** | C2 domain entries (blocking-aware detection) |
-| 11 | **Notepad++ Discovery + Signature** | Multi-source install discovery + Notepad++/GUP.exe Authenticode validation |
+| 11 | **Notepad++ Discovery + Signature** | Multi-source install discovery + Notepad++/GUP.exe Authenticode validation + pre-8.8.9 updater-hardening warning |
 | 12 | **Exfil Artifacts** | Recon staging files (1.txt, a.txt, u.bat) |
 | 13 | **Event Log Analysis** | PowerShell & Application log pattern matching |
 | 14 | **Entropy Detection** | Packed/obfuscated files (Shannon entropy > 7.2) |
@@ -171,6 +171,11 @@ The **Lotus Blossom** APT group (attributed to China) compromised Notepad++ host
 | **#2** | September–October 2025 | Lua-based loader |
 | **#3** | October 2025 onward | Chrysalis backdoor via DLL sideloading |
 
+Timeline notes validated against public reporting:
+- Notepad++ incident update states compromise activity started in **June 2025** and provider-side remediation completed by **December 2, 2025**
+- Kaspersky reports observed malicious payload deployment from **late July through November 2025**
+- Rapid7 details chain #3/USOShared overlap and additional loader/shellcode IoCs
+
 ### Chrysalis Backdoor Capabilities
 
 - DLL sideloading via renamed Bitdefender binaries
@@ -187,7 +192,24 @@ The **Lotus Blossom** APT group (attributed to China) compromised Notepad++ host
 | **CVE** | [CVE-2025-15556](https://www.cve.org/CVERecord?id=CVE-2025-15556) |
 | **Rapid7 Labs** | [The Chrysalis Backdoor: A Deep Dive into Lotus Blossom's toolkit](https://www.rapid7.com/blog/post/tr-chrysalis-backdoor-dive-into-lotus-blossoms-toolkit/) |
 | **Kaspersky GReAT** | [Notepad++ Supply Chain Attack](https://securelist.com/notepad-supply-chain-attack/118708/) |
+| **Notepad++ Official Update** | [Hijacked Incident Information Update](https://notepad-plus-plus.org/news/hijacked-incident-info-update/#) |
 | **MITRE ATT&CK** | [Lotus Blossom G0030](https://attack.mitre.org/groups/G0030/) |
+
+### Additional Rule Coverage
+
+This scanner incorporates selected Lotus Blossom-related filename/path patterns mapped to Rapid7 Chrysalis tradecraft, including:
+
+- USOShared short-name `c/dll/exe` payload pattern
+- Single-character `.txt` staging files in `AppData\\Roaming\\ProShow` and `AppData\\Roaming\\Adobe\\Scripts`
+- Strong path matches for `BluetoothService.exe`, `log.dll`, `load`, `ProShow.exe`, `alien.ini`, `script.exe`
+- Campaign-associated `libtcc.dll` filename sightings
+- Additional Rapid7 SHA-256 loader/shellcode artifacts (`admin`, `system`)
+- Malicious update URL patterns from Securelist timeline reporting (`update.exe`, `install.exe`, `AutoUpdater.exe` paths)
+
+### Third-Party Rule Source and License
+
+- Detection rules used for mapping: https://github.com/Neo23x0/signature-base/blob/master/iocs/filename-iocs.txt
+- License reference: https://github.com/Neo23x0/signature-base/blob/master/LICENSE
 
 ---
 
