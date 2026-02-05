@@ -10,7 +10,7 @@
     of Notepad++ hosting infrastructure (June - December 2025).
 
     This script does NOT modify your system. It only reads files, registry keys,
-    network state, and process lists.
+    network state, event logs, and process lists.
 
     Covers all three infection chains:
     - Chain #1: ProShow exploit (July-August 2025)
@@ -22,18 +22,21 @@
       2.  USOShared TinyCC artifacts (conf.c, libtcc.dll, svchost.exe)
       3.  SHA-256 / SHA-1 hash verification against known malware
       4.  DNS cache for C2 domains
-      5.  Active TCP connections to known C2 IPs
+      5.  Active TCP connections to known C2 IPs (Get-NetTCPConnection + netstat fallback)
       6.  Chrysalis mutex (Global\Jdhfv_1.0.1)
       7.  Running process path analysis
       8.  Registry Run/RunOnce with legitimate updater allowlist
       9.  Scheduled task action path analysis
       10. Hosts file C2 domains (blocking-aware)
-      11. Notepad++ install discovery + Notepad++/GUP.exe signature validation
+      11. Notepad++ install discovery + Notepad++/GUP.exe signature validation + securityError.log context
       12. Exfil staging artifacts (1.txt, a.txt, u.bat)
-      13. Windows Event Log pattern matching
+      13. Windows Event Log correlated pattern matching + DNS client telemetry
       14. High-entropy file detection (Shannon > 7.2)
       15. Campaign string/pattern content scanning
       16. Windows service path analysis
+
+    DeepScan additions:
+    - Windows Firewall history parsing (default: %windir%\System32\LogFiles\Firewall\pfirewall.log; profile/policy-defined paths supported)
 
 .PARAMETER OutputPath
     Directory for JSON/CSV report output when export switches are used.
@@ -45,7 +48,8 @@
     Export findings/report to JSON format.
 
 .PARAMETER DeepScan
-    Extends hash scanning to include Downloads, Temp, and ProgramData directories.
+    Extends hash scanning to include Downloads, Temp, and ProgramData directories,
+    expands event log coverage, and parses Windows Firewall history logs if enabled.
 
 .PARAMETER Quiet
     Suppresses console output for clean/OK checks. Only shows findings.
@@ -75,7 +79,7 @@
     Run without changing system execution policy.
 
 .NOTES
-    Version    : 1.1.1
+    Version    : 1.1.2
     Author     : Simon Schlieber (@schlieber)
     Repository : https://github.com/schlieber/NotepadPlusPlus-SupplyChain-IOC-Scanner
     Date       : February 2026
@@ -270,7 +274,7 @@ $Findings = [System.Collections.ArrayList]::new()
 $CheckExecution = [ordered]@{}
 $ScanStartTime = Get-Date
 $ScanId = [guid]::NewGuid().Guid
-$ScriptVersion = "1.1.1"
+$ScriptVersion = "1.1.2"
 $script:CurrentCheckId = 0
 $script:CurrentCheckName = "General"
 
@@ -377,6 +381,152 @@ function Expand-Normalize {
     return ($v -replace '/', '\').ToLowerInvariant()
 }
 
+function Test-DomainIndicatorMatch {
+    param(
+        [string]$ObservedDomain,
+        [string]$IndicatorDomain
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ObservedDomain) -or [string]::IsNullOrWhiteSpace($IndicatorDomain)) {
+        return $false
+    }
+
+    $observed = $ObservedDomain.Trim().Trim('.').ToLowerInvariant()
+    $indicator = $IndicatorDomain.Trim().Trim('.').ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($observed) -or [string]::IsNullOrWhiteSpace($indicator)) {
+        return $false
+    }
+
+    return ($observed -eq $indicator -or $observed.EndsWith(".$indicator"))
+}
+
+function Get-MatchedMaliciousDomainsFromText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+
+    $matched = New-Object System.Collections.Generic.HashSet[string]
+    $domainPattern = [regex]'(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b'
+
+    foreach ($m in $domainPattern.Matches($Text)) {
+        $candidate = [string]$m.Value
+        foreach ($iocDomain in $MaliciousDomains) {
+            if (Test-DomainIndicatorMatch -ObservedDomain $candidate -IndicatorDomain $iocDomain) {
+                [void]$matched.Add($iocDomain.ToLowerInvariant())
+            }
+        }
+    }
+
+    return @($matched)
+}
+
+function Parse-NetstatEndpoint {
+    param([string]$Endpoint)
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) { return $null }
+    $value = $Endpoint.Trim()
+
+    $bracketMatch = [regex]::Match($value, '^\[(?<Address>[^\]]+)\]:(?<Port>\d+)$')
+    if ($bracketMatch.Success) {
+        return [PSCustomObject]@{
+            Address = $bracketMatch.Groups['Address'].Value
+            Port    = [int]$bracketMatch.Groups['Port'].Value
+        }
+    }
+
+    $plainMatch = [regex]::Match($value, '^(?<Address>[^:]+):(?<Port>\d+)$')
+    if ($plainMatch.Success) {
+        return [PSCustomObject]@{
+            Address = $plainMatch.Groups['Address'].Value
+            Port    = [int]$plainMatch.Groups['Port'].Value
+        }
+    }
+
+    return $null
+}
+
+function Get-FirewallLogCandidates {
+    $candidates = New-Object System.Collections.Generic.HashSet[string]
+    $windir = if ($env:windir) { $env:windir } elseif ($env:SystemRoot) { $env:SystemRoot } else { $null }
+
+    if ($windir) {
+        [void]$candidates.Add((Join-Path $windir "System32\LogFiles\Firewall\pfirewall.log"))
+        [void]$candidates.Add((Join-Path $windir "System32\LogFiles\Firewall\pfirewall_Domain.log"))
+        [void]$candidates.Add((Join-Path $windir "System32\LogFiles\Firewall\pfirewall_Private.log"))
+        [void]$candidates.Add((Join-Path $windir "System32\LogFiles\Firewall\pfirewall_Public.log"))
+    }
+
+    # Registry-configured log file paths (if set via policy/CSP/GPO)
+    $regPaths = @(
+        "HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PrivateProfile"
+    )
+
+    foreach ($rp in $regPaths) {
+        try {
+            if (-not (Test-Path -Path $rp)) { continue }
+            $val = (Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue).LogFilePath
+            if ([string]::IsNullOrWhiteSpace($val)) { continue }
+            $expanded = $val.Trim().Trim('"')
+            try { $expanded = [Environment]::ExpandEnvironmentVariables($expanded) } catch {}
+            if (-not [string]::IsNullOrWhiteSpace($expanded)) {
+                [void]$candidates.Add($expanded)
+            }
+        }
+        catch {}
+    }
+
+    return @($candidates)
+}
+
+function Get-FirewallLogFields {
+    param([string]$LogPath)
+
+    $fieldsLine = $null
+    try {
+        $header = Get-Content -Path $LogPath -TotalCount 60 -ErrorAction Stop
+        $fieldsLine = $header | Where-Object { $_ -like '#Fields:*' } | Select-Object -Last 1
+    }
+    catch {}
+
+    if (-not $fieldsLine) { return @() }
+
+    $raw = ($fieldsLine -replace '^#Fields:\s*', '').Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+
+    $fields = $raw -split '\s+' | Where-Object { $_ }
+    return @($fields | ForEach-Object { $_.ToLowerInvariant() })
+}
+
+function Parse-FirewallLogLine {
+    param(
+        [string]$Line,
+        [string[]]$Fields,
+        [switch]$AllowExtra
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Line) -or -not $Fields -or $Fields.Count -eq 0) { return $null }
+    $parts = $Line.Trim() -split '\s+'
+    if ($parts.Count -lt $Fields.Count) { return $null }
+
+    if (-not $AllowExtra -and $parts.Count -gt $Fields.Count) {
+        $head = @()
+        if ($Fields.Count -gt 1) {
+            $head = $parts[0..($Fields.Count - 2)]
+        }
+        $tail = ($parts[($Fields.Count - 1)..($parts.Count - 1)] -join ' ')
+        $parts = @($head + $tail)
+    }
+
+    $map = [ordered]@{}
+    for ($i = 0; $i -lt $Fields.Count; $i++) {
+        $map[$Fields[$i]] = $parts[$i]
+    }
+    return $map
+}
+
 function Resolve-ExecutablePath {
     param(
         [string]$Value,
@@ -395,16 +545,22 @@ function Resolve-ExecutablePath {
         $v = Join-Path -Path $dir -ChildPath "notepad++.exe"
     }
     else {
-        if ($v -match '^\s*"([^"]+)"') {
-            $v = $Matches[1]
+        $quotedMatch = [regex]::Match($v, '^\s*"([^"]+)"')
+        if ($quotedMatch.Success) {
+            $v = $quotedMatch.Groups[1].Value
         }
-        elseif ($v -match '^\s*([^,]+?\.exe)\s*(,.*)?$') {
-            $v = $Matches[1]
+        else {
+            $commaMatch = [regex]::Match($v, '^\s*([^,]+?\.exe)\s*(,.*)?$')
+            if ($commaMatch.Success) {
+                $v = $commaMatch.Groups[1].Value
+            }
+            else {
+                $exeMatch = [regex]::Match($v, '^\s*([^\s]+\.exe)')
+                if ($exeMatch.Success) {
+                    $v = $exeMatch.Groups[1].Value
+                }
+            }
         }
-        elseif ($v -match '^\s*([^\s]+\.exe)') {
-            $v = $Matches[1]
-        }
-
         $v = $v.Trim().Trim('"')
         $v = $v -replace ',\s*\d+$', ''
     }
@@ -925,14 +1081,30 @@ function Test-DNSCache {
 
     try {
         $dns = Get-DnsClientCache -ErrorAction Stop
-        foreach ($d in $MaliciousDomains) {
-            $hits = $dns | Where-Object { $_.Entry -like "*$d*" }
-            foreach ($h in $hits) {
-                # DNS cache alone is a weak signal -> HIGH (not CRITICAL)
-                Write-Finding -Severity "HIGH" -Category "DNS" `
-                    -Message "Suspicious domain in DNS cache: $($h.Entry)" `
-                    -Details "Resolved to: $($h.Data) | Correlate with file/persistence IoCs"
+        $seen = New-Object System.Collections.Generic.HashSet[string]
+
+        foreach ($entry in $dns) {
+            $domain = [string]$entry.Entry
+            if ([string]::IsNullOrWhiteSpace($domain)) { continue }
+
+            $matchedDomains = @()
+            foreach ($iocDomain in $MaliciousDomains) {
+                if (Test-DomainIndicatorMatch -ObservedDomain $domain -IndicatorDomain $iocDomain) {
+                    $matchedDomains += $iocDomain
+                }
             }
+            if ($matchedDomains.Count -eq 0) { continue }
+
+            $key = "$($domain.ToLowerInvariant())|$($entry.Data)"
+            if (-not $seen.Add($key)) { continue }
+
+            # DNS cache alone is a weak signal -> HIGH (not CRITICAL)
+            Write-Finding -Severity "HIGH" -Category "DNS" `
+                -Message "Suspicious domain in DNS cache: $domain" `
+                -Details "MatchedDomains: $($matchedDomains -join ', ') | ResolvedTo: $($entry.Data) | Correlate with file/persistence IoCs"
+        }
+        if (-not $Quiet -and $seen.Count -eq 0) {
+            Write-Host "  [OK] No known malicious domains in DNS cache" -ForegroundColor Gray
         }
     }
     catch {
@@ -944,22 +1116,177 @@ function Test-DNSCache {
 function Test-NetworkConnections {
     Write-CheckHeader 5 "Active TCP connections to known IoC IPs..."
 
+    $reportedConnections = New-Object System.Collections.Generic.HashSet[string]
+    $usedFallback = $false
+
     try {
+        if (-not (Get-Command -Name Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
+            throw "Get-NetTCPConnection is unavailable"
+        }
+
         $conns = Get-NetTCPConnection -State Established -ErrorAction Stop
         foreach ($ip in $MaliciousIPs) {
             $hits = $conns | Where-Object { $_.RemoteAddress -eq $ip }
             foreach ($c in $hits) {
+                $entryKey = "$ip|$($c.OwningProcess)|$($c.RemotePort)|Get-NetTCPConnection"
+                if (-not $reportedConnections.Add($entryKey)) { continue }
+
                 $procName = $null
                 try { $procName = (Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue).Name } catch {}
                 Write-Finding -Severity "CRITICAL" -Category "Network" `
                     -Message "ACTIVE CONNECTION to IoC IP: $ip" `
-                    -Details "RemotePort: $($c.RemotePort) | PID: $($c.OwningProcess) | Process: $procName"
+                    -Details "Source: Get-NetTCPConnection | RemotePort: $($c.RemotePort) | PID: $($c.OwningProcess) | Process: $procName"
             }
         }
     }
     catch {
-        Write-Finding -Severity "INFO" -Category "Network" `
-            -Message "Could not query network connections" -Details $_.Exception.Message
+        $primaryError = $_.Exception.Message
+        $usedFallback = $true
+
+        if (-not $Quiet) {
+            Write-Host "  [INFO] Get-NetTCPConnection unavailable/failed, falling back to netstat parsing" -ForegroundColor DarkGray
+        }
+
+        try {
+            $netstatLines = & netstat -ano -p tcp 2>$null
+            if (-not $netstatLines) { throw "netstat returned no TCP data" }
+
+            foreach ($line in $netstatLines) {
+                $trimmed = [string]$line
+                if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+                $parts = $trimmed.Trim() -split '\s+'
+                if ($parts.Count -lt 5) { continue }
+                if ($parts[0] -ine "TCP") { continue }
+                if ($parts[3] -ine "ESTABLISHED") { continue }
+
+                $remote = Parse-NetstatEndpoint -Endpoint $parts[2]
+                if (-not $remote) { continue }
+
+                $remoteAddress = [string]$remote.Address
+                if ([string]::IsNullOrWhiteSpace($remoteAddress)) { continue }
+                if ($remoteAddress.Contains('%')) { $remoteAddress = $remoteAddress.Split('%')[0] }
+
+                if ($MaliciousIPs -notcontains $remoteAddress) { continue }
+
+                $owningProcessId = 0
+                [void][int]::TryParse([string]$parts[4], [ref]$owningProcessId)
+                $entryKey = "$remoteAddress|$owningProcessId|$($remote.Port)|netstat"
+                if (-not $reportedConnections.Add($entryKey)) { continue }
+
+                $procName = $null
+                if ($owningProcessId -gt 0) {
+                    try { $procName = (Get-Process -Id $owningProcessId -ErrorAction SilentlyContinue).Name } catch {}
+                }
+
+                Write-Finding -Severity "CRITICAL" -Category "Network" `
+                    -Message "ACTIVE CONNECTION to IoC IP: $remoteAddress" `
+                    -Details "Source: netstat | RemotePort: $($remote.Port) | PID: $owningProcessId | Process: $procName"
+            }
+        }
+        catch {
+            $fallbackError = $_.Exception.Message
+            Write-Finding -Severity "INFO" -Category "Network" `
+                -Message "Could not query active network connections" `
+                -Details "Get-NetTCPConnectionError: $primaryError | NetstatFallbackError: $fallbackError"
+        }
+    }
+
+    if ($DeepScan) {
+        try {
+            $maxLines = 8000
+            $maxFindings = 20
+            $lineDedup = New-Object System.Collections.Generic.HashSet[string]
+            $firewallFindings = 0
+
+            $logCandidates = Get-FirewallLogCandidates | Select-Object -Unique
+            $logPaths = $logCandidates | Where-Object { $_ -and (Test-Path -Path $_ -PathType Leaf) } | Select-Object -Unique
+            if (-not $logPaths -or $logPaths.Count -eq 0) {
+                $checked = $logCandidates -join '; '
+                Write-Finding -Severity "INFO" -Category "Firewall Log" `
+                    -Message "Windows Firewall log not found (deep history check skipped)" `
+                    -Details "Checked: $checked | Logging may be disabled or path customized"
+                return
+            }
+
+            foreach ($logPath in $logPaths) {
+                if ($firewallFindings -ge $maxFindings) { break }
+
+                $fields = Get-FirewallLogFields -LogPath $logPath
+                $allowExtra = $false
+                if (-not $fields -or $fields.Count -eq 0) {
+                    $fields = @("date", "time", "action", "protocol", "src-ip", "dst-ip", "src-port", "dst-port")
+                    $allowExtra = $true
+                }
+
+                $recentLines = Get-Content -Path $logPath -Tail $maxLines -ErrorAction Stop
+                foreach ($rawLine in $recentLines) {
+                    if ($firewallFindings -ge $maxFindings) { break }
+
+                    $line = [string]$rawLine
+                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                    if ($line.TrimStart().StartsWith("#")) { continue }
+
+                    $entry = Parse-FirewallLogLine -Line $line -Fields $fields -AllowExtra:$allowExtra
+                    if (-not $entry) { continue }
+
+                    $srcIp = if ($entry.Contains("src-ip")) { $entry["src-ip"] } elseif ($entry.Contains("srcip")) { $entry["srcip"] } else { $null }
+                    $dstIp = if ($entry.Contains("dst-ip")) { $entry["dst-ip"] } elseif ($entry.Contains("dstip")) { $entry["dstip"] } else { $null }
+
+                    $matchedIp = $null
+                    $direction = $null
+                    if ($srcIp -and ($MaliciousIPs -contains $srcIp)) {
+                        $matchedIp = $srcIp
+                        $direction = "Source"
+                    }
+                    elseif ($dstIp -and ($MaliciousIPs -contains $dstIp)) {
+                        $matchedIp = $dstIp
+                        $direction = "Destination"
+                    }
+                    if (-not $matchedIp) { continue }
+
+                    $date = if ($entry.Contains("date")) { $entry["date"] } else { "" }
+                    $time = if ($entry.Contains("time")) { $entry["time"] } else { "" }
+                    $action = if ($entry.Contains("action")) { $entry["action"] } else { "" }
+                    $proto = if ($entry.Contains("protocol")) { $entry["protocol"] } else { "" }
+                    $srcPort = if ($entry.Contains("src-port")) { $entry["src-port"] } elseif ($entry.Contains("srcport")) { $entry["srcport"] } else { "" }
+                    $dstPort = if ($entry.Contains("dst-port")) { $entry["dst-port"] } elseif ($entry.Contains("dstport")) { $entry["dstport"] } else { "" }
+                    $info = if ($entry.Contains("info")) { $entry["info"] } else { "" }
+                    $path = if ($entry.Contains("path")) { $entry["path"] } else { "" }
+
+                    $profileMatch = [regex]::Match($logPath, 'pfirewall_(Domain|Private|Public)\.log', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                    $firewallProfileName = if ($profileMatch.Success) { $profileMatch.Groups[1].Value } else { "Default" }
+                    $entryKey = "$logPath|$matchedIp|$direction|$date|$time|$action|$proto|$srcIp|$dstIp|$srcPort|$dstPort"
+                    if (-not $lineDedup.Add($entryKey)) { continue }
+
+                    $detailParts = @(
+                        "Source: WindowsFirewallLog",
+                        "Profile: $firewallProfileName",
+                        "LogPath: $logPath",
+                        "Direction: $direction",
+                        "Entry: $date $time $action $proto ${srcIp}:$srcPort -> ${dstIp}:$dstPort"
+                    )
+                    if (-not [string]::IsNullOrWhiteSpace($info)) { $detailParts += "Info: $info" }
+                    if (-not [string]::IsNullOrWhiteSpace($path)) { $detailParts += "AppPath: $path" }
+
+                    Write-Finding -Severity "MEDIUM" -Category "Firewall Log" `
+                        -Message "Historical firewall log match for IoC IP: $matchedIp" `
+                        -Details ($detailParts -join " | ")
+                    $firewallFindings++
+                }
+            }
+
+            if (-not $Quiet -and $firewallFindings -eq 0) {
+                Write-Host "  [OK] No IoC IP hits in recent Windows Firewall log history" -ForegroundColor Gray
+            }
+        }
+        catch {
+            Write-Finding -Severity "INFO" -Category "Firewall Log" `
+                -Message "Could not parse Windows Firewall history log" `
+                -Details $_.Exception.Message
+        }
+    }
+    elseif (-not $Quiet -and $usedFallback) {
+        Write-Host "  [OK] Network check completed using netstat fallback" -ForegroundColor Gray
     }
 }
 
@@ -1214,6 +1541,56 @@ function Test-NotepadVersion {
             catch {}
         }
     }
+
+    $securityLogPath = Join-Path $env:LOCALAPPDATA "Notepad++\log\securityError.log"
+    if (Test-Path -Path $securityLogPath -PathType Leaf) {
+        Write-Finding -Severity "INFO" -Category "Notepad++ Security Log" `
+            -Message "Notepad++ securityError.log present" `
+            -Details "Path: $securityLogPath | Presence alone is not malicious"
+
+        try {
+            $tailLines = Get-Content -Path $securityLogPath -Tail 300 -ErrorAction Stop
+            $matchedDomains = New-Object System.Collections.Generic.HashSet[string]
+            $matchedUrls = New-Object System.Collections.Generic.HashSet[string]
+            $contextLines = New-Object System.Collections.Generic.List[string]
+
+            foreach ($line in $tailLines) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+                foreach ($dom in (Get-MatchedMaliciousDomainsFromText -Text $line)) {
+                    [void]$matchedDomains.Add($dom)
+                }
+
+                $lineLower = $line.ToLowerInvariant()
+                foreach ($u in $MaliciousUpdateURLs) {
+                    $urlLower = $u.ToLowerInvariant()
+                    if ($lineLower.Contains($urlLower)) {
+                        [void]$matchedUrls.Add($u)
+                    }
+                }
+
+                if (($matchedDomains.Count -gt 0 -or $matchedUrls.Count -gt 0) -and $contextLines.Count -lt 5) {
+                    $preview = ($line -replace '[\r\n]+', ' ').Trim()
+                    if ($preview.Length -gt 180) { $preview = $preview.Substring(0, 180) + "..." }
+                    $contextLines.Add($preview)
+                }
+            }
+
+            if ($matchedDomains.Count -gt 0 -or $matchedUrls.Count -gt 0) {
+                Write-Finding -Severity "MEDIUM" -Category "Notepad++ Security Log" `
+                    -Message "securityError.log contains campaign-related domain/URL indicators" `
+                    -Details "Path: $securityLogPath | MatchedDomains: $(@($matchedDomains) -join ', ') | MatchedURLs: $(@($matchedUrls) -join ', ') | Context: $(@($contextLines) -join ' | ')"
+            }
+            elseif (-not $Quiet) {
+                Write-Host "  [OK] securityError.log present but no campaign IoCs found in recent entries" -ForegroundColor Gray
+            }
+        }
+        catch {
+            Write-Finding -Severity "INFO" -Category "Notepad++ Security Log" `
+                -Message "Could not parse securityError.log entries" `
+                -Details "Path: $securityLogPath | $($_.Exception.Message)"
+        }
+    }
 }
 
 function Test-ExfilArtifacts {
@@ -1324,26 +1701,33 @@ function Get-EventIndicatorMatches {
         [array]$IndicatorRules
     )
 
-    $matches = New-Object System.Collections.Generic.List[object]
+    # Avoid the built-in automatic $Matches variable and keep a plain object[] output
+    # for best compatibility with Windows PowerShell 5.1.
+    $indicatorHits = New-Object System.Collections.Generic.List[object]
     foreach ($rule in $IndicatorRules) {
-        if ($Text -match $rule.Regex) {
-            $matches.Add([PSCustomObject]@{
-                    Name   = $rule.Name
-                    Regex  = $rule.Regex
-                    Weight = $rule.Weight
+        $regexMatch = [regex]::Match($Text, [string]$rule.Regex, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($regexMatch.Success) {
+            $sample = [string]$regexMatch.Value
+            if ($sample.Length -gt 120) { $sample = $sample.Substring(0, 120) + "..." }
+            [void]$indicatorHits.Add([PSCustomObject]@{
+                    Name        = $rule.Name
+                    Pattern     = [string]$rule.Regex
+                    Weight      = $rule.Weight
+                    MatchSample = $sample
                 })
         }
     }
 
-    $strong = @($matches | Where-Object { $_.Weight -ge 80 } | Select-Object -ExpandProperty Name -Unique)
-    $medium = @($matches | Where-Object { $_.Weight -lt 80 } | Select-Object -ExpandProperty Name -Unique)
+    $allHits = @($indicatorHits.ToArray())
+    $strong = @($allHits | Where-Object { $_.Weight -ge 80 } | Select-Object -ExpandProperty Name -Unique)
+    $medium = @($allHits | Where-Object { $_.Weight -lt 80 } | Select-Object -ExpandProperty Name -Unique)
     $isMatch = ($strong.Count -ge 1) -or ($medium.Count -ge 2)
 
     return [PSCustomObject]@{
         IsMatch = $isMatch
         Strong  = $strong
         Medium  = $medium
-        All     = @($matches | Select-Object -Unique Name, Regex, Weight)
+        All     = $allHits
     }
 }
 
@@ -1364,7 +1748,8 @@ function Test-EventLogs {
         @{ Name = "Adobe Scripts loader path"; Weight = 85; Regex = '\\appdata\\roaming\\adobe\\scripts\\(?:alien\.ini|script\.exe)' },
         @{ Name = "Chrysalis mutex reference"; Weight = 100; Regex = 'global\\jdhfv_1\.0\.1' },
         @{ Name = "temp.sh exfil upload"; Weight = 90; Regex = 'temp\.sh/upload|curl\.exe\s+-f\s+\"?file=@' },
-        @{ Name = "Known C2 domain"; Weight = 90; Regex = 'api\.skycloudcenter\.com|api\.wiresguard\.com|cdncheck\.it\.com|safe-dns\.it\.com|self-dns\.it\.com' },
+        # Domain text by itself is often noisy in logs, keep this as supportive evidence only.
+        @{ Name = "Known C2 domain"; Weight = 55; Regex = 'api\.skycloudcenter\.com|api\.wiresguard\.com|cdncheck\.it\.com|safe-dns\.it\.com|self-dns\.it\.com' },
         @{ Name = "Known update URL pattern"; Weight = 85; Regex = '45\.76\.155\.202/update/(?:update|install|autoupdater)\.exe|45\.32\.144\.255/update/update\.exe|95\.179\.213\.0/update/(?:update|install|autoupdater)\.exe' },
         @{ Name = "Recon command chain"; Weight = 70; Regex = 'whoami&&tasklist(?:&&systeminfo&&netstat\s+-ano)?' },
         @{ Name = "Split recon command"; Weight = 70; Regex = 'cmd\s+/c\s+(?:whoami|tasklist|systeminfo|netstat\s+-ano)\s*>>\s*a\.txt' },
@@ -1384,6 +1769,11 @@ function Test-EventLogs {
             LogName = "System"
             EventIds = @(7045)
             Providers = @("Service Control Manager")
+            QueryType = "Generic"
+        },
+        @{
+            LogName = "Microsoft-Windows-DNS-Client/Operational"
+            QueryType = "DNSClient"
         }
     )
 
@@ -1392,18 +1782,22 @@ function Test-EventLogs {
             @{
                 LogName = "Microsoft-Windows-TaskScheduler/Operational"
                 EventIds = @(106, 140, 141, 200, 201)
+                QueryType = "Generic"
             },
             @{
                 LogName = "Microsoft-Windows-Sysmon/Operational"
                 EventIds = @(1, 3, 7, 11, 13, 22)
+                QueryType = "Generic"
             },
             @{
                 LogName = "Security"
                 EventIds = @(4688)
+                QueryType = "Generic"
             },
             @{
                 LogName = "Application"
                 EventIds = @(1000, 1001)
+                QueryType = "Generic"
             }
         )
     }
@@ -1444,7 +1838,7 @@ function Test-EventLogs {
                 LogName = $logName
                 StartTime = $startTime
             }
-            if ($q.EventIds) { $filter.Id = $q.EventIds }
+            if ($q.EventIds -and $q.EventIds.Count -gt 0) { $filter.Id = $q.EventIds }
             if ($q.Providers) { $filter.ProviderName = $q.Providers }
 
             $events = Get-WinEvent -FilterHashtable $filter -MaxEvents $maxEvents -ErrorAction Stop
@@ -1459,17 +1853,103 @@ function Test-EventLogs {
         foreach ($e in $events) {
             if ($findingsInLog -ge $maxFindingsPerLog) { break }
 
-            $msg = $null
-            try { $msg = $e.FormatDescription() } catch {}
-            if ([string]::IsNullOrWhiteSpace($msg)) {
-                try { $msg = $e.Message } catch {}
-            }
+            $msg = Get-EventMessageText -EventRecord $e
 
             $xml = $null
             try { $xml = $e.ToXml() } catch {}
+            $dataMap = Get-EventDataMap -EventRecord $e
 
             $searchText = @($msg, $xml) -join "`n"
             if ([string]::IsNullOrWhiteSpace($searchText)) { continue }
+
+            if ($q.QueryType -eq "DNSClient") {
+                $queryFieldCandidates = @("QueryName", "Query", "Name", "HostName", "TargetName", "UserData.QueryName", "UserData.Query", "UserData.Name")
+                $queryValues = New-Object System.Collections.Generic.List[object]
+
+                foreach ($field in $queryFieldCandidates) {
+                    if ($dataMap.Contains($field)) {
+                        $fieldValue = [string]$dataMap[$field]
+                        if ([string]::IsNullOrWhiteSpace($fieldValue)) { continue }
+
+                        $exists = $false
+                        foreach ($existing in $queryValues) {
+                            if ($existing.Field -eq $field -and $existing.Value -eq $fieldValue) { $exists = $true; break }
+                        }
+                        if (-not $exists) {
+                            $queryValues.Add([PSCustomObject]@{
+                                    Field = $field
+                                    Value = $fieldValue
+                                })
+                        }
+                    }
+                }
+
+                if ($queryValues.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($msg)) {
+                    foreach ($dom in (Get-MatchedMaliciousDomainsFromText -Text $msg)) {
+                        $queryValues.Add([PSCustomObject]@{ Field = "MessageExtract"; Value = $dom })
+                    }
+                }
+
+                $matchedDomains = New-Object System.Collections.Generic.HashSet[string]
+                $matchedEvidence = New-Object System.Collections.Generic.List[string]
+
+                foreach ($queryItem in $queryValues) {
+                    $domainCandidates = New-Object System.Collections.Generic.HashSet[string]
+                    $qv = ([string]$queryItem.Value).Trim()
+                    $sourceField = [string]$queryItem.Field
+                    if (-not [string]::IsNullOrWhiteSpace($qv)) {
+                        [void]$domainCandidates.Add($qv.Trim('.'))
+                    }
+
+                    $domainsInValue = Get-MatchedMaliciousDomainsFromText -Text $qv
+                    foreach ($domainInValue in $domainsInValue) {
+                        [void]$domainCandidates.Add($domainInValue)
+                    }
+
+                    foreach ($candidateDomain in $domainCandidates) {
+                        foreach ($iocDomain in $MaliciousDomains) {
+                            if (-not (Test-DomainIndicatorMatch -ObservedDomain $candidateDomain -IndicatorDomain $iocDomain)) { continue }
+
+                            [void]$matchedDomains.Add($iocDomain)
+                            if ($matchedEvidence.Count -lt 4) {
+                                $evidence = "Field=$sourceField Pattern=$iocDomain Value=$qv"
+                                if (-not $matchedEvidence.Contains($evidence)) {
+                                    $matchedEvidence.Add($evidence)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if ($matchedDomains.Count -eq 0) { continue }
+
+                $contextItems = @(
+                    $queryValues |
+                    Select-Object -First 3 |
+                    ForEach-Object { "$($_.Field)=$($_.Value)" }
+                )
+                $contextStr = if ($contextItems.Count -gt 0) {
+                    ($contextItems | ForEach-Object { ([string]$_ -replace '[\r\n]+', ' ').Trim() } | Where-Object { $_ } | ForEach-Object {
+                            if ($_.Length -gt 120) { $_.Substring(0, 120) + "..." } else { $_ }
+                        }) -join " | "
+                }
+                else { "[dns query field unavailable]" }
+
+                $messagePreview = [string]$msg
+                $messagePreview = $messagePreview -replace '[\r\n]+', ' '
+                if ($messagePreview.Length -gt 220) { $messagePreview = $messagePreview.Substring(0, 220) + "..." }
+
+                $details = "EventTime: $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | EventId: $($e.Id) | Log: $logName | Provider: $($e.ProviderName) | Level: $($e.LevelDisplayName) | Confidence: StructuredDNS | MatchedIndicators: Known C2 domain | MatchedEvidence: $(@($matchedEvidence) -join '; ') | MatchedDomains: $(@($matchedDomains) -join ', ') | Context: $contextStr | MessageSample: $messagePreview"
+                $displayDetails = "Time: $($e.TimeCreated.ToString('HH:mm:ss')) | DNS exact/subdomain match | Domains: $(@($matchedDomains) -join ', ')"
+
+                Write-Finding -Severity "HIGH" -Category "Event Log" `
+                    -Message "DNS query for known C2 domain in $logName (ID: $($e.Id))" `
+                    -Details $details `
+                    -DisplayDetails $displayDetails
+
+                $findingsInLog++
+                continue
+            }
 
             $matchResult = Get-EventIndicatorMatches -Text $searchText -IndicatorRules $indicatorRules
             if (-not $matchResult.IsMatch) { continue }
@@ -1481,14 +1961,16 @@ function Test-EventLogs {
             }
             if ($isSelfReference) { continue }
 
-            $dataMap = Get-EventDataMap -EventRecord $e
             $contextSource = if (-not [string]::IsNullOrWhiteSpace($msg)) { $msg } else { $xml }
             $contextSnippets = @()
 
             foreach ($hit in $matchResult.All) {
-                $pat = [string]$hit.Regex
-                if ($contextSource -and $contextSource -match "(.{0,70}$pat.{0,70})") {
-                    $snippet = $Matches[1] -replace '[\r\n]+', ' '
+                $pat = [string]$hit.Pattern
+                if ($contextSource) {
+                    $contextMatch = [regex]::Match($contextSource, "(.{0,70}$pat.{0,70})", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                    if (-not $contextMatch.Success) { continue }
+
+                    $snippet = $contextMatch.Groups[1].Value -replace '[\r\n]+', ' '
                     $snippet = $snippet.Trim()
                     if ($snippet.Length -gt 150) { $snippet = $snippet.Substring(0, 150) + "..." }
                     if ($snippet -and $snippet -notin $contextSnippets) {
@@ -1500,6 +1982,15 @@ function Test-EventLogs {
 
             # Build clean, structured output
             $matchedStr = (@($matchResult.All | Select-Object -ExpandProperty Name -Unique) -join ", ")
+            $matchedEvidence = @(
+                $matchResult.All |
+                Select-Object -First 4 |
+                ForEach-Object {
+                    $sample = [string]$_.MatchSample
+                    if ([string]::IsNullOrWhiteSpace($sample)) { $sample = "[no sample]" }
+                    "$($_.Name) | Pattern=$($_.Pattern) | Sample=$sample"
+                }
+            ) -join "; "
             $contextStr = if ($contextSnippets.Count -gt 0) {
                 ($contextSnippets -join " | ")
             }
@@ -1536,7 +2027,7 @@ function Test-EventLogs {
             $sev = if ($matchResult.Strong.Count -gt 0) { "HIGH" } else { "MEDIUM" }
 
             # Structured details for JSON
-            $details = "EventTime: $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | EventId: $($e.Id) | Log: $logName | Provider: $($e.ProviderName) | Level: $($e.LevelDisplayName) | Confidence: $confidence | MatchedIndicators: $matchedStr | EventData: $($eventDataSummary -join '; ') | Context: $contextStr | MessageSample: $messagePreview"
+            $details = "EventTime: $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | EventId: $($e.Id) | Log: $logName | Provider: $($e.ProviderName) | Level: $($e.LevelDisplayName) | Confidence: $confidence | MatchedIndicators: $matchedStr | MatchedEvidence: $matchedEvidence | EventData: $($eventDataSummary -join '; ') | Context: $contextStr | MessageSample: $messagePreview"
 
             # Shorter display for console
             $displayDetails = "Time: $($e.TimeCreated.ToString('HH:mm:ss')) | $confidence | Matched: $matchedStr"

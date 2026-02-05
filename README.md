@@ -35,15 +35,15 @@ A **read-only, non-destructive PowerShell scanner** that detects **Indicators of
 | 2 | **USOShared Payloads** | TinyCC compiler artifacts (conf.c, libtcc.dll, svchost.exe) |
 | 3 | **File Hashes** | SHA-256/SHA-1 verification against known malware samples |
 | 4 | **DNS Cache** | C2 domain resolution history |
-| 5 | **Network Connections** | Active TCP connections to 7 known C2 IP addresses |
+| 5 | **Network Connections** | Active TCP connections to 7 known C2 IPs (`Get-NetTCPConnection` with `netstat` fallback) + optional DeepScan firewall history (`pfirewall*.log`, profile/policy-aware) |
 | 6 | **Chrysalis Mutex** | Runtime backdoor detection (`Global\Jdhfv_1.0.1`) |
 | 7 | **Running Processes** | Path-based suspicious process analysis |
 | 8 | **Registry Persistence** | Run/RunOnce keys with legitimate updater allowlist |
 | 9 | **Scheduled Tasks** | Task action path analysis |
 | 10 | **Hosts File** | C2 domain entries (blocking-aware detection) |
-| 11 | **Notepad++ Discovery + Signature** | Multi-source install discovery + Notepad++/GUP.exe Authenticode validation + pre-8.8.9 updater-hardening warning |
+| 11 | **Notepad++ Discovery + Signature** | Multi-source install discovery + Notepad++/GUP.exe Authenticode validation + securityError.log context + pre-8.8.9 updater-hardening warning |
 | 12 | **Exfil Artifacts** | Recon staging files (1.txt, a.txt, u.bat) |
-| 13 | **Event Log Analysis** | Correlated indicator matching across PowerShell, System, Task Scheduler, Sysmon, and Security logs |
+| 13 | **Event Log Analysis** | Correlated indicator matching across PowerShell/System/Task Scheduler/Sysmon/Security + structured DNS Client telemetry (`Microsoft-Windows-DNS-Client/Operational`) |
 | 14 | **Entropy Detection** | Packed/obfuscated files (Shannon entropy > 7.2) |
 | 15 | **Content Scanning** | Campaign strings, decryption keys, C2 URLs |
 | 16 | **Windows Services** | Service path analysis for persistence |
@@ -78,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File Detect-Chrysalis.ps1
 # Standard scan with colored output
 .\Detect-Chrysalis.ps1
 
-# Deep scan (includes additional user/app/package paths + expanded event logs)
+# Deep scan (includes additional user/app/package paths, expanded event logs, and firewall history check)
 .\Detect-Chrysalis.ps1 -DeepScan
 
 # Export JSON report
@@ -98,7 +98,7 @@ powershell -ExecutionPolicy Bypass -File Detect-Chrysalis.ps1
 | `-OutputPath` | Directory for JSON/CSV reports when export switches are used |
 | `-ExportJSON` | Export full report to JSON |
 | `-ExportCSV` | Export findings to CSV |
-| `-DeepScan` | Scan additional directories for hash matches and expand event log coverage |
+| `-DeepScan` | Scan additional directories for hash matches, expand event log coverage, and parse Windows Firewall history logs (`pfirewall*.log`, profile/policy-aware) |
 | `-Quiet` | Suppress clean/OK output, only show findings |
 
 ---
@@ -130,6 +130,8 @@ The JSON report now includes:
 - `Summary` (severity totals)
 - `CheckSummary` (all 16 checks, start/end timestamps, finding count)
 - `Findings` with per-finding `CheckId`/`CheckName` context
+- Event-log findings include matched indicator evidence and context snippets for faster triage
+- Firewall-log findings include profile + log-path context when available
 
 ### Notepad++ Install Discovery Sources
 
@@ -231,6 +233,7 @@ This scanner incorporates selected Lotus Blossom-related filename/path patterns 
 - Some checks require **elevated privileges** for complete coverage
 - Event log coverage depends on local audit/logging policy and available retention
 - Network detection may miss **cleared DNS caches**
+- Firewall history parsing requires Windows Firewall logging enabled (default: `%windir%\System32\LogFiles\Firewall\pfirewall.log`, or profile/policy-defined `pfirewall*.log`)
 
 ---
 
